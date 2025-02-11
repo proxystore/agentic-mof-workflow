@@ -4,11 +4,13 @@ import collections
 import itertools
 import threading
 import logging
+from datetime import datetime
 from concurrent.futures import Future
 from queue import Queue, Empty
 from threading import Semaphore, Event
 from typing import Sequence
 
+import ase
 import ray
 from aeris.behavior import Behavior, loop, action
 from aeris.handle import Handle
@@ -22,6 +24,8 @@ from mofa.agentic.task import (
 )
 from mofa.model import MOFRecord, LigandDescription
 from mofa.simulation.lammps import LAMMPSRunner
+from mofa.scoring.geometry import LatticeParameterChange
+from mofa.utils.conversions import write_to_string
 
 
 logger = logging.getLogger(__name__)
@@ -220,11 +224,13 @@ class Validator(Behavior):
             delete_finished=config.delete_finished,
         )
 
-        self.validator_queue = Queue(maxsize=config.max_queue_depth)
+        self.validator_queue: Queue[MOFRecord] = Queue(
+            maxsize=config.max_queue_depth,
+        )
         self.validator_count = Semaphore(value=config.num_workers)
         self.validator_tasks = {}
 
-        self.process_queue = Queue()
+        self.process_queue: Queue[tuple[MOFRecord, list[ase.Atoms]]] = Queue()
 
     @action
     def submit_mof(self, mofs: Sequence[MOFRecord]) -> None:
@@ -243,13 +249,13 @@ class Validator(Behavior):
                 continue
 
             try:
-                mof = self.validator_queue.get(timeout=1)
+                record = self.validator_queue.get(timeout=1)
             except Empty:
                 self.assembly_count.release()
 
             task = validate_structure_task(
                 runner=self.runner,
-                mof=mof,
+                mof=record,
                 timesteps=self.config.timesteps,
                 report_frequency=self.config.report_frequency,
             ).remote()
@@ -261,24 +267,26 @@ class Validator(Behavior):
     def process_validation(self, shutdown: Event) -> None:
         while not shutdown.is_set():
             try:
-                _ = self.process_queue.get(timeout=1)
+                record, frames = self.process_queue.get(timeout=1)
             except Empty:
                 continue
 
             # Compute the lattice strain
-            # TODO: figure this out and log
-            # scorer = LatticeParameterChange()
-            # traj_vasp = [write_to_string(t, "vasp") for t in traj]
-            # strain = scorer.score_mof(record)
+            scorer = LatticeParameterChange()
+            frames_vasp = [write_to_string(f, "vasp") for f in frames]
+            record.md_trajectory["uff"] = frames_vasp
+            strain = scorer.score_mof(record)
+            record.structure_stability["uff"] = strain
+            record.times["md-done"] = datetime.now()
 
     def _validate_task_callback(self, future: Future) -> None:
         self.validator_count.release()
         self.validator_tasks.pop(future)
         try:
-            result = future.result()
+            record, frames = future.result()
         except Exception:
             logger.exception("Error in validation task")
-        self.process_queue.put(result)
+        self.process_queue.put((record, frames))
 
 
 class Optimizer(Behavior):
