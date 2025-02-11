@@ -8,7 +8,7 @@ from datetime import datetime
 from concurrent.futures import Future
 from queue import Queue, Empty
 from threading import Semaphore, Event
-from typing import Sequence
+from typing import Any, Sequence
 
 import ase
 import ray
@@ -28,11 +28,23 @@ from mofa.scoring.geometry import LatticeParameterChange
 from mofa.utils.conversions import write_to_string
 
 
-logger = logging.getLogger(__name__)
+class MOFABehavior(Behavior):
+    def __init__(self, *, logger_name: str, ray_address: str) -> None:
+        self.logger = logging.getLogger(logger_name)
+        self.ray_address = ray_address
+
+    def setup(self) -> None:
+        if not ray.is_initialized():
+            ray.init(self.ray_address, configure_logging=False)
+
+    def shutdown(self) -> None:
+        if ray.is_initialized():
+            ray.shutdown()
 
 
-class Database(Behavior):
-    def __init__(self, generator: Handle[Generator]) -> None: ...
+class Database(MOFABehavior):
+    def __init__(self, generator: Handle[Generator], **kwargs: Any) -> None:
+        super().__init__(logger_name="Database", **kwargs)
 
     @loop
     def periodic_retrain(self, shutdown: Event) -> None:
@@ -54,11 +66,12 @@ class Database(Behavior):
         ...
 
 
-class Generator(Behavior):
+class Generator(MOFABehavior):
     def __init__(
         self,
         assembler: Handle[Assembler],
         config: GeneratorConfig,
+        **kwargs: Any,
     ) -> None:
         self.assembler = assembler
         self.config = config
@@ -74,6 +87,8 @@ class Generator(Behavior):
         self.generator_count = Semaphore(value=config.num_workers)
         self.generator_tasks: set[ray.ObjectRef] = set()
         self.process_tasks: dict[Future, ray.ObjectRef] = {}
+
+        super().__init__(logger_name="Generator", **kwargs)
 
     @loop
     def submit_generate_ligands(self, shutdown: Event) -> None:
@@ -97,6 +112,11 @@ class Generator(Behavior):
                 n_samples=self.config.num_samples,
                 device=self.config.device,
             )
+            self.logger.info(
+                "Submitted generate-ligands task (type=%s size=%d)",
+                ligand.anchor_type,
+                size,
+            )
             self.generator_tasks.put(task)
             # Push this generation task back on the queue
             self.generate_queue.append((ligand_id, size))
@@ -113,8 +133,16 @@ class Generator(Behavior):
                 except StopIteration:
                     # Task is finished so let another task be submitted.
                     self.generator_count.release()
+                    self.logger.info("Completed generate-ligands task")
                 else:
+                    self.logger.info(
+                        "Received generate-ligands batch (size=%d)", len(batch)
+                    )
                     task = process_ligands_task(batch).remote()
+                    self.logger.info(
+                        "Submitted process-ligands task (size=%d)",
+                        len(batch),
+                    )
                     future = task.future()
                     self.process_tasks[future] = task
                     future.add_done_callback(self._process_ligands_callback)
@@ -124,7 +152,14 @@ class Generator(Behavior):
         try:
             valid_ligands, all_ligands = future.result()
         except Exception:
-            logger.exception("Error in process ligands task")
+            self.logger.exception("Failure in process-ligands task")
+            return
+
+        self.logger.info(
+            "Received process-ligands batch (valid=%s, rate=%.2f\%)",
+            len(valid_ligands),
+            100 * (len(valid_ligands) / len(all_ligands)),
+        )
 
         if len(valid_ligands) == 0:
             return
@@ -142,7 +177,9 @@ class Generator(Behavior):
         try:
             action_future.result()
         except Exception:
-            logger.exception("Error requesting submit_ligands action")
+            self.logger.exception("Error in submit-ligands action")
+        else:
+            self.logger.info("Submitted ligands to assembler")
 
     @action
     def retrain(self) -> None:
@@ -152,18 +189,21 @@ class Generator(Behavior):
         ...
 
 
-class Assembler(Behavior):
+class Assembler(MOFABehavior):
     def __init__(
         self,
         *,
         validator: Handle[Validator],
         config: AssemblyConfig,
+        **kwargs: Any,
     ) -> None:
         self.assembly_queues = collections.defaultdict(
             lambda: collections.deque(maxlen=config.max_queue_depth),
         )
         self.assembly_count = threading.Semaphore(value=config.num_workers)
         self.assembly_tasks = {}
+
+        super().__init__(logger_name="Assembler", **kwargs)
 
     @action
     def submit_ligands(
@@ -173,6 +213,11 @@ class Assembler(Behavior):
     ) -> None:
         # Submit a batch of ligands to the assembler's queue for MOF assembly.
         self.assembly_queues[anchor_type].extend(valid_ligands)
+        self.logger.info(
+            "Added ligands to assembly queue (anchor_type=%s, count=%d",
+            anchor_type,
+            len(valid_ligands),
+        )
 
     @loop
     def submit_assembly(self, shutdown: Event) -> None:
@@ -195,6 +240,7 @@ class Assembler(Behavior):
                 to_make=self.config.num_mofs,
                 attemps=self.config.max_attempts,
             ).remote()
+            self.logger.info("Sumitted assemble-mofs task")
             future = task.future()
             self.assembly_tasks[future] = task
             future.add_done_callback(self._assembly_task_callback)
@@ -205,17 +251,21 @@ class Assembler(Behavior):
         try:
             mofs = future.result()
         except Exception:
-            logger.exception("Error in assembly task")
+            self.logger.exception("Failure in assemble-mofs task")
+            return
 
+        self.logger.info("Received assemble-mofs batch (count=%d)", len(mofs))
         action_future = self.validator.action("submit_mofs", mofs)
         try:
             action_future.result()
         except Exception:
-            logger.exception("Error request submit_mofs action")
+            self.logger.exception("Error in submit-mofs action")
+        else:
+            self.logger.info("Submitted mofs to validator")
 
 
-class Validator(Behavior):
-    def __init__(self, config: ValidatorConfig) -> None:
+class Validator(MOFABehavior):
+    def __init__(self, config: ValidatorConfig, **kwargs: Any) -> None:
         self.config = config
         self.runner = LAMMPSRunner(
             lammps_command=config.lammps_command,
@@ -232,11 +282,14 @@ class Validator(Behavior):
 
         self.process_queue: Queue[tuple[MOFRecord, list[ase.Atoms]]] = Queue()
 
+        super().__init__(logger_name="Validator", **kwargs)
+
     @action
     def submit_mof(self, mofs: Sequence[MOFRecord]) -> None:
         # Submit a MOF to the Validator's queue for validation (lammps).
         for mof in mofs:
             self.validator_queue.put(mof)
+        self.logger.info("Added mofs to validation queue (count=%d", len(mofs))
 
     @loop
     def submit_validation(self, shutdown: Event) -> None:
@@ -259,6 +312,9 @@ class Validator(Behavior):
                 timesteps=self.config.timesteps,
                 report_frequency=self.config.report_frequency,
             ).remote()
+            self.logger.info(
+                "Submitted validate-structures task (name=%s)", record.name
+            )
             future = task.future()
             self.validator_tasks[future] = task
             future.add_done_callback(self._validate_task_callback)
@@ -271,6 +327,12 @@ class Validator(Behavior):
             except Empty:
                 continue
 
+            self.logger.info(
+                "Computing lattice strain (name=%s, frames=%d, queue_size=%d)",
+                record.name,
+                len(frames),
+                self.process_queue.qsize(),
+            )
             # Compute the lattice strain
             scorer = LatticeParameterChange()
             frames_vasp = [write_to_string(f, "vasp") for f in frames]
@@ -278,6 +340,11 @@ class Validator(Behavior):
             strain = scorer.score_mof(record)
             record.structure_stability["uff"] = strain
             record.times["md-done"] = datetime.now()
+            self.logger.info(
+                "Computed lattice strain (name=%s, strain=%.1f)",
+                record.name,
+                100 * strain,
+            )
 
     def _validate_task_callback(self, future: Future) -> None:
         self.validator_count.release()
@@ -285,11 +352,20 @@ class Validator(Behavior):
         try:
             record, frames = future.result()
         except Exception:
-            logger.exception("Error in validation task")
+            self.logger.exception("Failure in validate-structures task")
+            return
+
+        self.logger.info(
+            "Receieved validate-structures result (name=%s)",
+            record.name,
+        )
         self.process_queue.put((record, frames))
 
 
-class Optimizer(Behavior):
+class Optimizer(MOFABehavior):
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(logger_name="Optimizer", **kwargs)
+
     @action
     def submit_mof(self) -> None:
         # Submit a MOF to the Optimizer's queue for optimization.
