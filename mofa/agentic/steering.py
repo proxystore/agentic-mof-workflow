@@ -3,6 +3,7 @@ from __future__ import annotations
 import collections
 import itertools
 import threading
+import time
 import logging
 from datetime import datetime
 from concurrent.futures import Future
@@ -280,7 +281,11 @@ class Validator(MOFABehavior):
         self.validator_count = Semaphore(value=config.num_workers)
         self.validator_tasks = {}
 
+        self.simulations_budget = config.simulation_budget
+        self.simulations_completed = 0
+
         self.process_queue: Queue[tuple[MOFRecord, list[ase.Atoms]]] = Queue()
+        self.processed_mofs: int = 0
 
         super().__init__(logger_name="Validator", **kwargs)
 
@@ -290,6 +295,16 @@ class Validator(MOFABehavior):
         for mof in mofs:
             self.validator_queue.put(mof)
         self.logger.info("Added mofs to validation queue (count=%d", len(mofs))
+
+    @loop
+    def monitor_budget(self, shutdown: Event) -> None:
+        while not shutdown.is_set():
+            if self.simulations_completed >= self.simulations_budget:
+                shutdown.set()
+                self.logger.info(
+                    "Shutting down validator after simulation budget reached",
+                )
+            time.sleep(1)
 
     @loop
     def submit_validation(self, shutdown: Event) -> None:
@@ -360,6 +375,11 @@ class Validator(MOFABehavior):
             record.name,
         )
         self.process_queue.put((record, frames))
+        self.simulations_completed += 1
+        self.logger.info(
+            "Simulation budget remaining: %d",
+            self.simulations_budget - self.simulations_completed,
+        )
 
 
 class Optimizer(MOFABehavior):

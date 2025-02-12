@@ -56,4 +56,6 @@ class ValidatorConfig:
     num_workers: int
     """Number of validation workers."""
     report_frequency: int
+    simulation_budget: int
+    """Maximum number of simulations to perform before ending the workflow."""
     timesteps: int
