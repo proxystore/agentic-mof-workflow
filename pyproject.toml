@@ -40,7 +40,9 @@ dependencies = [
     "gpustat",
 
     # Data management
-    "pymongo>=4"
+    "pymongo>=4",
+
+    "ray[default]",
 ]
 
 [tool.setuptools.packages.find]

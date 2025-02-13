@@ -21,7 +21,7 @@ def generate_ligands_task(
     n_samples: int = 1,
     n_steps: int = None,
     device: str = "cpu",
-) -> Generator[tuple[LigandDescription, ...]]:
+) -> Generator[tuple[LigandDescription, ...], None, None]:
     generator = run_generator(
         model=model,
         templates=templates,

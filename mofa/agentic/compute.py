@@ -1,7 +1,6 @@
 import dataclasses
 
 
-@dataclasses.dataclass
 class ComputeConfig:
     num_generator_workers: int
     num_assembly_workers: int
@@ -11,13 +10,15 @@ class ComputeConfig:
     lammps_env: dict[str, str]
 
 
-@dataclasses.dataclass
+@dataclasses.dataclass(kw_only=True)
 class PolarisSingleNode(ComputeConfig):
     num_generator_workers = 1
     num_assembly_workers = 8
     num_validator_workers = 3
     torch_device = "cuda"
-    lammps_cmd = ("lmp_serial",)
+    lammps_cmd = (
+        "/eagle/MOFA/jgpaul/lammps/build-gpu-nompi-mixed -sf gpu -pk gpu 1"
+    ).split()
     lammps_env = {}
 
 

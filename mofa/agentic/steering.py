@@ -5,6 +5,7 @@ import itertools
 import threading
 import time
 import logging
+import random
 from datetime import datetime
 from concurrent.futures import Future
 from queue import Queue, Empty
@@ -16,7 +17,7 @@ import ray
 from aeris.behavior import Behavior, loop, action
 from aeris.handle import Handle
 
-from mofa.agentic.config import AssemblyConfig, GeneratorConfig, ValidatorConfig
+from mofa.agentic.config import AssemblerConfig, GeneratorConfig, ValidatorConfig
 from mofa.agentic.task import (
     assemble_mofs_task,
     validate_structure_task,
@@ -83,7 +84,7 @@ class Generator(MOFABehavior):
         tasks = list(
             itertools.product(range(len(config.templates)), config.atom_counts)
         )
-        tasks.shuffle()
+        random.shuffle(tasks)
         self.generator_queue = Queue(tasks)
         self.generator_count = Semaphore(value=config.num_workers)
         self.generator_tasks: set[ray.ObjectRef] = set()
@@ -195,7 +196,7 @@ class Assembler(MOFABehavior):
         self,
         *,
         validator: Handle[Validator],
-        config: AssemblyConfig,
+        config: AssemblerConfig,
         **kwargs: Any,
     ) -> None:
         self.assembly_queues = collections.defaultdict(

@@ -16,7 +16,7 @@ from openbabel import openbabel
 
 from mofa.model import NodeDescription, LigandTemplate
 from mofa.agentic.compute import COMPUTE_CONFIGS
-from mofa.agentic.config import GeneratorConfig, ValidatorConfig, AssemblyConfig
+from mofa.agentic.config import GeneratorConfig, ValidatorConfig, AssemblerConfig
 from mofa.agentic.steering import Generator, Assembler, Validator
 
 RDLogger.DisableLog("rdApp.*")
@@ -172,35 +172,22 @@ def parse_args() -> argparse.Namespace:
         required=True,
         help="Configuration for the HPC system",
     )
-    group.add_argument(
-        "--ai-fraction",
-        default=0.1,
-        type=float,
-        help="Fraction of workers devoted to AI tasks",
-    )
-    group.add_argument(
-        "--dft-fraction",
-        default=0.1,
-        type=float,
-        help="Fraction of workers devoted to DFT tasks",
-    )
 
     return parser.parse_args()
 
 
 def configure_logging(run_dir: pathlib.Path) -> logging.Logger:
-    main = logging.getLogger("main")
     handlers = [
         logging.StreamHandler(sys.stdout),
         logging.FileHandler(run_dir / "run.log"),
     ]
-    for handler in handlers:
-        formatter = logging.Formatter(
-            "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-        )
-        handler.setFormatter(formatter)
-        main.addHandler(handler)
-    main.setLevel(logging.INFO)
+    formatter = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    logging.basicConfig(
+        format=formatter,
+        level=logging.INFO,
+        handlers=handlers,
+    )
+    main = logging.getLogger("main")
     return main
 
 
@@ -220,6 +207,8 @@ def main() -> int:
     (run_dir / "params.json").write_text(json.dumps(params))
 
     logger = configure_logging(run_dir)
+    logger.info("Loaded run params")
+    logger.info("Created run directory: %s", run_dir)
 
     # Load the ligand descriptions
     templates = []
@@ -234,6 +223,8 @@ def main() -> int:
 
     # Make all agent configs
     compute = COMPUTE_CONFIGS[args.compute_config]
+    logger.info("Using compute config: %r", compute)
+
     generator_config = GeneratorConfig(
         generator_path=args.generator_path,
         templates=templates,
@@ -243,7 +234,7 @@ def main() -> int:
         device=compute.torch_device,
         num_samples=args.num_samples,
     )
-    assembler_config = AssemblyConfig(
+    assembler_config = AssemblerConfig(
         max_queue_depth=50 * compute.num_generator_workers,
         max_attempts=4,
         min_ligand_candidates=args.minimum_ligand_pool,
@@ -264,6 +255,7 @@ def main() -> int:
         simulation_budget=args.simulation_budget,
         timesteps=args.md_timesteps,
     )
+    logger.info("Initialized agent configs")
 
     with Manager(
         exchange=ThreadExchange(),
@@ -293,6 +285,7 @@ def main() -> int:
             config=validator_config,
             ray_address=args.ray_address,
         )
+        logger.info("Initialized agent behaviors")
 
         # Launch agents using preregistered IDs
         _ = manager.launch(
