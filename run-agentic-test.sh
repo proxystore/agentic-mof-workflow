@@ -26,16 +26,18 @@ python -m mofa.agentic.run \
       --maximum-strain 0.5 \
       --retrain-freq 1 \
       --num-epochs 4 \
-      --num-samples 128 \
-      --gen-batch-size 64 \
-      --simulation-budget 8 \
+      --num-samples 1024 \
+      --gen-batch-size 8096 \
+      --simulation-budget 16 \
       --md-timesteps 100000 \
       --md-snapshots 10 \
+      --retain-lammps \
       --raspa-timesteps 10000 \
-      --lammps-on-ramdisk \
       --dft-opt-steps 2 \
       --compute-config polaris-single \
-      --ray-address localhost:6379
+      --ray-address localhost:6379 \
+      --log-level INFO
+      # --lammps-on-ramdisk \
 echo Python done
 
 # Shutdown services

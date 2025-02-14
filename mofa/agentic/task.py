@@ -12,7 +12,7 @@ from mofa.simulation.lammps import LAMMPSRunner
 from mofa.model import LigandDescription, LigandTemplate, MOFRecord, NodeDescription
 
 
-@ray.remote(num_cpus=8, num_gpus=1)
+@ray.remote(num_cpus=4, num_gpus=1)
 def generate_ligands_task(
     model: str | pathlib.Path,
     templates: Sequence[LigandTemplate],
@@ -56,8 +56,8 @@ def validate_structure_task(
     mof: MOFRecord,
     timesteps: int,
     report_frequency: int,
-) -> list[ase.Atoms]:
-    return runner.run_molecular_dynamics(
+) -> tuple[MOFRecord, list[ase.Atoms]]:
+    return mof, runner.run_molecular_dynamics(
         mof,
         timesteps=timesteps,
         report_frequency=report_frequency,

@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-import collections
 import itertools
 import threading
+import traceback
 import time
 import logging
 import random
 from datetime import datetime
+from collections import defaultdict, deque
 from concurrent.futures import Future
 from queue import Queue, Empty
 from threading import Semaphore, Event
@@ -29,6 +30,8 @@ from mofa.simulation.lammps import LAMMPSRunner
 from mofa.scoring.geometry import LatticeParameterChange
 from mofa.utils.conversions import write_to_string
 
+_ray_init_lock = threading.Lock()
+
 
 class MOFABehavior(Behavior):
     def __init__(self, *, logger_name: str, ray_address: str) -> None:
@@ -36,12 +39,16 @@ class MOFABehavior(Behavior):
         self.ray_address = ray_address
 
     def setup(self) -> None:
-        if not ray.is_initialized():
-            ray.init(self.ray_address, configure_logging=False)
+        pass
+        # with _ray_init_lock:
+        #     if not ray.is_initialized():
+        #         ray.init(self.ray_address, configure_logging=False)
 
     def shutdown(self) -> None:
-        if ray.is_initialized():
-            ray.shutdown()
+        pass
+        # with _ray_init_lock:
+        #     if ray.is_initialized():
+        #         ray.shutdown()
 
 
 class Database(MOFABehavior):
@@ -79,18 +86,45 @@ class Generator(MOFABehavior):
         self.config = config
 
         self.initial_model_path = config.generator_path
-        self.lastest_model_path = config.generator_path
+        self.latest_model_path = config.generator_path
 
-        tasks = list(
-            itertools.product(range(len(config.templates)), config.atom_counts)
-        )
-        random.shuffle(tasks)
-        self.generator_queue = Queue(tasks)
-        self.generator_count = Semaphore(value=config.num_workers)
         self.generator_tasks: set[ray.ObjectRef] = set()
         self.process_tasks: dict[Future, ray.ObjectRef] = {}
 
         super().__init__(logger_name="Generator", **kwargs)
+
+    def setup(self) -> None:
+        super().setup()
+
+        self.generator_queue = Queue()
+        self.generator_count = Semaphore(value=self.config.num_workers)
+
+        tasks = list(
+            itertools.product(
+                range(len(self.config.templates)),
+                self.config.atom_counts,
+            )
+        )
+        random.shuffle(tasks)
+        for task in tasks:
+            self.generator_queue.put(task)
+
+    def shutdown(self) -> None:
+        cancelled = 0
+        for task in self.generator_tasks:
+            ray.cancel(task)
+            cancelled += 1
+        self.logger.info(
+            "Cancelled %s generate-ligands task(s) after shutdown", cancelled
+        )
+
+        cancelled = 0
+        for task in self.process_tasks.values():
+            ray.cancel(task)
+            cancelled += 1
+        self.logger.info(
+            "Cancelled %s process-ligands task(s) after shutdown", cancelled
+        )
 
     @loop
     def submit_generate_ligands(self, shutdown: Event) -> None:
@@ -102,11 +136,14 @@ class Generator(MOFABehavior):
             if not self.generator_count.acquire(timeout=1):
                 continue
 
-            ligand_id, size = self.generator_queue.get()
-            ligand = self.config.templates[ligand_id]
+            try:
+                ligand_id, size = self.generator_queue.get(timeout=1)
+            except Empty:
+                self.generator_count.release()
+                continue
 
-            task = ray.remote(
-                generate_ligands_task,
+            ligand = self.config.templates[ligand_id]
+            task = generate_ligands_task.remote(
                 batch_size=self.config.batch_size,
                 model=self.latest_model_path,
                 templates=[ligand],
@@ -115,32 +152,36 @@ class Generator(MOFABehavior):
                 device=self.config.device,
             )
             self.logger.info(
-                "Submitted generate-ligands task (type=%s size=%d)",
+                "Submitted generate-ligands task (type=%s size=%d, samples=%d)",
                 ligand.anchor_type,
                 size,
+                self.config.num_samples,
             )
-            self.generator_tasks.put(task)
+            self.generator_tasks.add(task)
             # Push this generation task back on the queue
-            self.generate_queue.append((ligand_id, size))
+            self.generator_queue.put((ligand_id, size))
 
     @loop
     def submit_process_ligands(self, shutdown: Event) -> None:
         # Passes batches from generator tasks to process ligands tasks
         while not shutdown.is_set():
             # Check which generator tasks have ready batches
-            ready, _ = ray.wait(self.generator_tasks)
+            ready, _ = ray.wait(list(self.generator_tasks), timeout=1)
             for task in ready:
                 try:
-                    batch = next(task)
+                    batch_ref = next(task)
                 except StopIteration:
                     # Task is finished so let another task be submitted.
                     self.generator_count.release()
+                    self.generator_tasks.remove(task)
                     self.logger.info("Completed generate-ligands task")
                 else:
+                    # TODO: this could be passed as ref to next task
+                    batch = ray.get(batch_ref)
                     self.logger.info(
                         "Received generate-ligands batch (size=%d)", len(batch)
                     )
-                    task = process_ligands_task(batch).remote()
+                    task = process_ligands_task.remote(batch)
                     self.logger.info(
                         "Submitted process-ligands task (size=%d)",
                         len(batch),
@@ -158,7 +199,7 @@ class Generator(MOFABehavior):
             return
 
         self.logger.info(
-            "Received process-ligands batch (valid=%s, rate=%.2f\%)",
+            "Received process-ligands batch (valid=%s, rate=%.2f%%)",
             len(valid_ligands),
             100 * (len(valid_ligands) / len(all_ligands)),
         )
@@ -177,7 +218,11 @@ class Generator(MOFABehavior):
             valid_ligands,
         )
         try:
-            action_future.result()
+            action_future.result(timeout=5)
+        except TimeoutError:
+            self.logger.warning(
+                "Timeout in submit-ligands action. Is the assembler actor alive?"
+            )
         except Exception:
             self.logger.exception("Error in submit-ligands action")
         else:
@@ -199,13 +244,28 @@ class Assembler(MOFABehavior):
         config: AssemblerConfig,
         **kwargs: Any,
     ) -> None:
-        self.assembly_queues = collections.defaultdict(
-            lambda: collections.deque(maxlen=config.max_queue_depth),
-        )
-        self.assembly_count = threading.Semaphore(value=config.num_workers)
-        self.assembly_tasks = {}
-
+        self.config = config
+        self.validator = validator
         super().__init__(logger_name="Assembler", **kwargs)
+
+    def setup(self) -> None:
+        super().setup()
+
+        self.assembly_queues = defaultdict(
+            lambda: deque(maxlen=self.config.max_queue_depth),
+        )
+        self.assembly_count = threading.Semaphore(value=self.config.num_workers)
+        self.assembly_tasks = {}
+        self.enabled = threading.Event()
+
+    def shutdown(self) -> None:
+        cancelled = 0
+        for task in self.assembly_tasks.values():
+            ray.cancel(task)
+            cancelled += 1
+        self.logger.info(
+            "Cancelled %s assemble-ligands task(s) after shutdown", cancelled
+        )
 
     @action
     def submit_ligands(
@@ -216,7 +276,7 @@ class Assembler(MOFABehavior):
         # Submit a batch of ligands to the assembler's queue for MOF assembly.
         self.assembly_queues[anchor_type].extend(valid_ligands)
         self.logger.info(
-            "Added ligands to assembly queue (anchor_type=%s, count=%d",
+            "Added ligands to assembly queue (anchor_type=%s, count=%d)",
             anchor_type,
             len(valid_ligands),
         )
@@ -227,22 +287,33 @@ class Assembler(MOFABehavior):
         # the process_assembly loop to determine max number of assembly
         # tasks to run at any point.
         while not shutdown.is_set():
+            if not self.enabled.wait(timeout=1):
+                continue
+
             # Acquired workers are released in the callback on the task future.
             if not self.assembly_count.acquire(timeout=1):
                 continue
 
-            candidates = sum(len(q) for q in self.assembly_queues.values())
-            if candidates < self.config.min_ligand_candidates:
+            # TODO: handle dictionary resizing here in a better fashion than
+            # copying the dict
+            candidates = sum(len(q) for q in self.assembly_queues.copy().values())
+            if (
+                candidates < self.config.min_ligand_candidates
+                # assemble_many() requires 2 COO and 1 cyano ligands
+                or "COO" not in self.assembly_queues
+                or "cyano" not in self.assembly_queues
+            ):
                 self.assembly_count.release()
                 continue
 
-            task = assemble_mofs_task(
-                dict((k, list(v)) for k, v in self.assembly_queue.items()),
+            ligand_options = dict((k, list(v)) for k, v in self.assembly_queues.items())
+            task = assemble_mofs_task.remote(
+                ligand_options=ligand_options,
                 nodes=self.config.node_templates,
                 to_make=self.config.num_mofs,
-                attemps=self.config.max_attempts,
-            ).remote()
-            self.logger.info("Sumitted assemble-mofs task")
+                attempts=self.config.max_attempts,
+            )
+            self.logger.info("Submitted assemble-mofs task")
             future = task.future()
             self.assembly_tasks[future] = task
             future.add_done_callback(self._assembly_task_callback)
@@ -259,15 +330,35 @@ class Assembler(MOFABehavior):
         self.logger.info("Received assemble-mofs batch (count=%d)", len(mofs))
         action_future = self.validator.action("submit_mofs", mofs)
         try:
-            action_future.result()
+            action_future.result(timeout=5)
+        except TimeoutError:
+            self.logger.warning(
+                "Timeout in submit-mofs action. Is the validator actor alive?"
+            )
         except Exception:
             self.logger.exception("Error in submit-mofs action")
         else:
             self.logger.info("Submitted mofs to validator")
 
+    @action
+    def enable_assembly(self) -> None:
+        self.logger.info("Enabling MOF assembly")
+        self.enabled.set()
+
+    @action
+    def disable_assembly(self) -> None:
+        self.logger.info("Disabling MOF assembly")
+        self.enabled.clear()
+
 
 class Validator(MOFABehavior):
-    def __init__(self, config: ValidatorConfig, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        assembler: Handle[Assembler],
+        config: ValidatorConfig,
+        **kwargs: Any,
+    ) -> None:
+        self.assembler = assembler
         self.config = config
         self.runner = LAMMPSRunner(
             lammps_command=config.lammps_command,
@@ -275,37 +366,74 @@ class Validator(MOFABehavior):
             lammps_environ=config.lammps_environ,
             delete_finished=config.delete_finished,
         )
-
-        self.validator_queue: Queue[MOFRecord] = Queue(
-            maxsize=config.max_queue_depth,
-        )
-        self.validator_count = Semaphore(value=config.num_workers)
-        self.validator_tasks = {}
-
         self.simulations_budget = config.simulation_budget
-        self.simulations_completed = 0
-
-        self.process_queue: Queue[tuple[MOFRecord, list[ase.Atoms]]] = Queue()
-        self.processed_mofs: int = 0
+        self.queue_threshold = max(
+            self.config.num_workers,
+            int(0.8 * self.config.max_queue_depth),
+        )
 
         super().__init__(logger_name="Validator", **kwargs)
 
+    def setup(self) -> None:
+        super().setup()
+
+        self.assembler_enabled = False
+
+        self.validator_queue: deque[MOFRecord] = deque(
+            maxlen=self.config.max_queue_depth,
+        )
+        self.validator_count = Semaphore(value=self.config.num_workers)
+        self.validator_tasks = {}
+
+        self.simulations_completed = 0
+
+        self.process_queue: Queue[tuple[MOFRecord, list[ase.Atoms]]] = Queue()
+        self.processed_mofs = 0
+
+    def shutdown(self) -> None:
+        cancelled = 0
+        for task in self.validator_tasks.values():
+            ray.cancel(task)
+            cancelled += 1
+        self.logger.info(
+            "Cancelled %d validate-structures task(s) after shutdown", cancelled
+        )
+
+    def _check_queue_depth(self, timeout: float) -> None:
+        # TODO: lock this to prevent race conditions?
+        if len(self.validator_queue) > self.queue_threshold and self.assembler_enabled:
+            self.assembler.action("disable_assembly").result(timeout=timeout)
+            self.assembler_enabled = False
+        elif (
+            len(self.validator_queue) < self.queue_threshold
+            and not self.assembler_enabled
+        ):
+            self.assembler.action("enable_assembly").result(timeout=timeout)
+            self.assembler_enabled = True
+
     @action
-    def submit_mof(self, mofs: Sequence[MOFRecord]) -> None:
+    def submit_mofs(self, mofs: Sequence[MOFRecord]) -> None:
         # Submit a MOF to the Validator's queue for validation (lammps).
         for mof in mofs:
-            self.validator_queue.put(mof)
-        self.logger.info("Added mofs to validation queue (count=%d", len(mofs))
+            self.validator_queue.append(mof)
+        self.logger.info("Added mofs to validation queue (count=%d)", len(mofs))
+        self._check_queue_depth(timeout=5)
 
     @loop
     def monitor_budget(self, shutdown: Event) -> None:
         while not shutdown.is_set():
-            if self.simulations_completed >= self.simulations_budget:
-                shutdown.set()
-                self.logger.info(
-                    "Shutting down validator after simulation budget reached",
-                )
-            time.sleep(1)
+            if self.simulations_completed < self.simulations_budget:
+                time.sleep(1)
+                continue
+
+            self.logger.info(
+                "Simulation budget reached! Shutting down validator...",
+            )
+            try:
+                self.assembler.action("disable_assembly").result(timeout=5)
+            except TimeoutError:
+                pass
+            shutdown.set()
 
     @loop
     def submit_validation(self, shutdown: Event) -> None:
@@ -313,21 +441,24 @@ class Validator(MOFABehavior):
         # with the process_validation loop to determine the max number of
         # assembly tasks to run at any point.
         while not shutdown.is_set():
+            self._check_queue_depth(timeout=5)
+
             # Acquired workers are released in the callback on the task future.
             if not self.validator_count.acquire(timeout=1):
                 continue
 
             try:
-                record = self.validator_queue.get(timeout=1)
-            except Empty:
-                self.assembly_count.release()
+                record = self.validator_queue.pop()
+            except IndexError:
+                self.validator_count.release()
+                continue
 
-            task = validate_structure_task(
+            task = validate_structure_task.remote(
                 runner=self.runner,
                 mof=record,
                 timesteps=self.config.timesteps,
                 report_frequency=self.config.report_frequency,
-            ).remote()
+            )
             self.logger.info(
                 "Submitted validate-structures task (name=%s)", record.name
             )
@@ -367,20 +498,18 @@ class Validator(MOFABehavior):
         self.validator_tasks.pop(future)
         try:
             record, frames = future.result()
-        except Exception:
-            self.logger.exception("Failure in validate-structures task")
+        except Exception as e:
+            self.logger.warning("Failure in validate-structures task: %s", e)
+            self.logger.debug("Failure traceback: %r\n%s", e, traceback.format_exc())
             return
 
-        self.logger.info(
-            "Receieved validate-structures result (name=%s)",
-            record.name,
-        )
-        self.process_queue.put((record, frames))
         self.simulations_completed += 1
         self.logger.info(
-            "Simulation budget remaining: %d",
+            "Received validate-structures result (name=%s, budget-left=%d)",
+            record.name,
             self.simulations_budget - self.simulations_completed,
         )
+        self.process_queue.put((record, frames))
 
 
 class Optimizer(MOFABehavior):

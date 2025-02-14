@@ -11,6 +11,7 @@ import sys
 from aeris.launcher.thread import ThreadLauncher
 from aeris.exchange.thread import ThreadExchange
 from aeris.manager import Manager
+import ray
 from rdkit import RDLogger
 from openbabel import openbabel
 
@@ -30,6 +31,7 @@ def parse_args() -> argparse.Namespace:
         type=int,
         help="Number of simulations to submit before exiting",
     )
+    parser.add_argument("--log-level", default="INFO", help="Logging level")
 
     group = parser.add_argument_group(
         title="MOF Settings",
@@ -176,19 +178,20 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def configure_logging(run_dir: pathlib.Path) -> logging.Logger:
-    handlers = [
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler(run_dir / "run.log"),
-    ]
-    formatter = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+def configure_logging(run_dir: pathlib.Path, level: str) -> logging.Logger:
+    stream_handler = logging.StreamHandler(sys.stdout)
+    stream_handler.setLevel(level)
+
+    file_handler = logging.FileHandler(run_dir / "run.log")
+    file_handler.setLevel(logging.DEBUG)
+
     logging.basicConfig(
-        format=formatter,
-        level=logging.INFO,
-        handlers=handlers,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        level=logging.DEBUG,
+        handlers=[stream_handler, file_handler],
     )
-    main = logging.getLogger("main")
-    return main
+
+    return logging.getLogger("main")
 
 
 def main() -> int:
@@ -206,7 +209,7 @@ def main() -> int:
     # Save the run parameters to disk
     (run_dir / "params.json").write_text(json.dumps(params))
 
-    logger = configure_logging(run_dir)
+    logger = configure_logging(run_dir, args.log_level)
     logger.info("Loaded run params")
     logger.info("Created run directory: %s", run_dir)
 
@@ -257,6 +260,8 @@ def main() -> int:
     )
     logger.info("Initialized agent configs")
 
+    ray.init(args.ray_address, configure_logging=False)
+
     with Manager(
         exchange=ThreadExchange(),
         launcher=ThreadLauncher(),
@@ -282,34 +287,28 @@ def main() -> int:
             ray_address=args.ray_address,
         )
         validator_behavior = Validator(
+            assembler=assembler_handle,
             config=validator_config,
             ray_address=args.ray_address,
         )
         logger.info("Initialized agent behaviors")
 
         # Launch agents using preregistered IDs
-        _ = manager.launch(
-            generator_behavior,
-            agent_id=generator_id,
-        )
-        assembler_handle = manager.launch(
-            assembler_behavior,
-            agent_id=assembler_id,
-        )
-        validator_handle = manager.launch(
-            validator_behavior,
-            agent_id=validator_id,
-        )
+        manager.launch(generator_behavior, agent_id=generator_id)
+        manager.launch(assembler_behavior, agent_id=assembler_id)
+        manager.launch(validator_behavior, agent_id=validator_id)
 
         try:
             manager.wait(validator_id)
         except KeyboardInterrupt:
             # Exiting the context manager will cause the agents to be shutdown.
             logger.info("Requesting validator to shutdown...")
-            manager.shutdown(validator_id, block=True)
+            manager.shutdown(validator_id, blocking=True)
 
         logger.info("Shutting down remaining agents...")
     logger.info("All agents completed!")
+    ray.shutdown()
+    logger.info("Ray shutdown")
 
 
 if __name__ == "__main__":
