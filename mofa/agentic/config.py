@@ -1,8 +1,11 @@
-import dataclasses
-import pathlib
-import functools
+from __future__ import annotations
 
-from mofa.model import LigandTemplate, NodeDescription
+import dataclasses
+import functools
+import pathlib
+
+from mofa.model import LigandTemplate
+from mofa.model import NodeDescription
 
 
 @dataclasses.dataclass
@@ -26,7 +29,7 @@ class GeneratorConfig:
 
     @functools.cached_property
     def anchor_types(self) -> set[str]:
-        return set(x.anchor_type for x in self.templates)
+        return {x.anchor_type for x in self.templates}
 
 
 @dataclasses.dataclass

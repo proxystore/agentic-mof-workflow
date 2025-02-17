@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import dataclasses
 
 
@@ -22,7 +24,7 @@ class PolarisSingleNode(ComputeConfig):
     lammps_cmd = (
         "/eagle/MOFA/jgpaul/lammps/build-gpu-nompi-mixed/lmp -sf gpu -pk gpu 1"
     ).split()
-    lammps_env = {}
+    lammps_env = dataclasses.field(default_factory=dict)
 
 
 COMPUTE_CONFIGS = {
