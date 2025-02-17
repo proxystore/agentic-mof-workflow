@@ -1,24 +1,29 @@
 from __future__ import annotations
 
-from datetime import datetime
 import argparse
-import pathlib
-import logging
 import hashlib
 import json
+import logging
+import pathlib
 import sys
+from datetime import datetime
 
-from aeris.launcher.thread import ThreadLauncher
-from aeris.exchange.thread import ThreadExchange
-from aeris.manager import Manager
 import ray
-from rdkit import RDLogger
+from aeris.exchange.thread import ThreadExchange
+from aeris.launcher.thread import ThreadLauncher
+from aeris.manager import Manager
 from openbabel import openbabel
+from rdkit import RDLogger
 
-from mofa.model import NodeDescription, LigandTemplate
 from mofa.agentic.compute import COMPUTE_CONFIGS
-from mofa.agentic.config import GeneratorConfig, ValidatorConfig, AssemblerConfig
-from mofa.agentic.steering import Generator, Assembler, Validator
+from mofa.agentic.config import AssemblerConfig
+from mofa.agentic.config import GeneratorConfig
+from mofa.agentic.config import ValidatorConfig
+from mofa.agentic.steering import Assembler
+from mofa.agentic.steering import Generator
+from mofa.agentic.steering import Validator
+from mofa.model import LigandTemplate
+from mofa.model import NodeDescription
 
 RDLogger.DisableLog("rdApp.*")
 openbabel.obErrorLog.SetOutputLevel(0)
@@ -37,7 +42,9 @@ def parse_args() -> argparse.Namespace:
         title="MOF Settings",
         description="Options related to the MOF type being generated",
     )
-    group.add_argument("--node-path", required=True, help="Path to a node record")
+    group.add_argument(
+        "--node-path", required=True, help="Path to a node record",
+    )
 
     group = parser.add_argument_group(
         title="Generator Settings",
@@ -75,7 +82,8 @@ def parse_args() -> argparse.Namespace:
     )
 
     group = parser.add_argument_group(
-        "Retraining Settings", description="How often to retain, what to train on, etc"
+        "Retraining Settings",
+        description="How often to retain, what to train on, etc",
     )
     group.add_argument(
         "--generator-config-path",
@@ -95,7 +103,7 @@ def parse_args() -> argparse.Namespace:
         help="Maximum number of MOFs to use for retraining",
     )
     group.add_argument(
-        "--num-epochs", type=int, default=128, help="Number of training epochs"
+        "--num-epochs", type=int, default=128, help="Number of training epochs",
     )
     group.add_argument(
         "--best-fraction",
@@ -111,7 +119,8 @@ def parse_args() -> argparse.Namespace:
     )
 
     group = parser.add_argument_group(
-        title="Assembly Settings", description="Options related to MOF assembly"
+        title="Assembly Settings",
+        description="Options related to MOF assembly",
     )
     group.add_argument(
         "--max-assemble-attempts",
@@ -160,9 +169,12 @@ def parse_args() -> argparse.Namespace:
     )
 
     group = parser.add_argument_group(
-        title="Compute Settings", description="Compute environment configuration"
+        title="Compute Settings",
+        description="Compute environment configuration",
     )
-    group.add_argument("--ray-address", required=True, help="Ray cluster address")
+    group.add_argument(
+        "--ray-address", required=True, help="Ray cluster address",
+    )
     group.add_argument(
         "--lammps-on-ramdisk",
         action="store_true",
@@ -221,7 +233,7 @@ def main() -> int:
 
     # Load the example MOF
     node_template = NodeDescription(
-        **json.loads(pathlib.Path(args.node_path).read_text())
+        **json.loads(pathlib.Path(args.node_path).read_text()),
     )
 
     # Make all agent configs
@@ -250,7 +262,9 @@ def main() -> int:
         lammps_command=compute.lammps_cmd,
         lammps_environ=compute.lammps_env,
         lmp_sims_root_path=(
-            "/dev/shm/lmp_run" if args.lammps_on_ramdisk else str(run_dir / "lmp_run")
+            "/dev/shm/lmp_run"
+            if args.lammps_on_ramdisk
+            else str(run_dir / "lmp_run")
         ),
         max_queue_depth=8 * compute.num_validator_workers,
         num_workers=compute.num_validator_workers,
@@ -309,6 +323,8 @@ def main() -> int:
     logger.info("All agents completed!")
     ray.shutdown()
     logger.info("Ray shutdown")
+
+    return 0
 
 
 if __name__ == "__main__":

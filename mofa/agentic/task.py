@@ -1,25 +1,31 @@
+from __future__ import annotations
+
 import pathlib
-from typing import Generator, Sequence
+from collections.abc import Generator
+from collections.abc import Sequence
 
 import ase
 import ray
 from more_itertools import batched
 
-from mofa.assembly.validate import process_ligands
 from mofa.assembly.assemble import assemble_many
+from mofa.assembly.validate import process_ligands
 from mofa.generator import run_generator
+from mofa.model import LigandDescription
+from mofa.model import LigandTemplate
+from mofa.model import MOFRecord
+from mofa.model import NodeDescription
 from mofa.simulation.lammps import LAMMPSRunner
-from mofa.model import LigandDescription, LigandTemplate, MOFRecord, NodeDescription
 
 
 @ray.remote(num_cpus=4, num_gpus=1)
-def generate_ligands_task(
+def generate_ligands_task(  # noqa: PLR0913
     model: str | pathlib.Path,
     templates: Sequence[LigandTemplate],
     batch_size: int,
     n_atoms: int | str = 8,
     n_samples: int = 1,
-    n_steps: int = None,
+    n_steps: int | None = None,
     device: str = "cpu",
 ) -> Generator[tuple[LigandDescription, ...], None, None]:
     generator = run_generator(
