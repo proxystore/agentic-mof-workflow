@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 import pathlib
+import subprocess
 import sys
 from datetime import datetime
 
@@ -20,6 +21,7 @@ from mofa.agentic.config import AssemblerConfig
 from mofa.agentic.config import GeneratorConfig
 from mofa.agentic.config import ValidatorConfig
 from mofa.agentic.steering import Assembler
+from mofa.agentic.steering import Database
 from mofa.agentic.steering import Generator
 from mofa.agentic.steering import Validator
 from mofa.model import LigandTemplate
@@ -43,7 +45,9 @@ def parse_args() -> argparse.Namespace:
         description="Options related to the MOF type being generated",
     )
     group.add_argument(
-        "--node-path", required=True, help="Path to a node record",
+        "--node-path",
+        required=True,
+        help="Path to a node record",
     )
 
     group = parser.add_argument_group(
@@ -103,7 +107,10 @@ def parse_args() -> argparse.Namespace:
         help="Maximum number of MOFs to use for retraining",
     )
     group.add_argument(
-        "--num-epochs", type=int, default=128, help="Number of training epochs",
+        "--num-epochs",
+        type=int,
+        default=128,
+        help="Number of training epochs",
     )
     group.add_argument(
         "--best-fraction",
@@ -173,7 +180,9 @@ def parse_args() -> argparse.Namespace:
         description="Compute environment configuration",
     )
     group.add_argument(
-        "--ray-address", required=True, help="Ray cluster address",
+        "--ray-address",
+        required=True,
+        help="Ray cluster address",
     )
     group.add_argument(
         "--lammps-on-ramdisk",
@@ -204,6 +213,70 @@ def configure_logging(run_dir: pathlib.Path, level: str) -> logging.Logger:
     )
 
     return logging.getLogger("main")
+
+
+def run(
+    *,
+    generator_config: GeneratorConfig,
+    assembler_config: AssemblerConfig,
+    validator_config: ValidatorConfig,
+    ray_address: str,
+    logger: logging.Logger,
+) -> None:
+    with Manager(
+        exchange=ThreadExchange(),
+        launcher=ThreadLauncher(),
+    ) as manager:
+        # Register agents
+        generator_id = manager.exchange.create_agent()
+        assembler_id = manager.exchange.create_agent()
+        validator_id = manager.exchange.create_agent()
+        database_id = manager.exchange.create_agent()
+
+        # Construct unbound handles to share with agent behaviors
+        assembler_handle = manager.exchange.create_handle(assembler_id)
+        validator_handle = manager.exchange.create_handle(validator_id)
+        database_handle = manager.exchange.create_handle(database_id)
+        generator_handle = manager.exchange.create_handle(generator_id)
+
+        # Intialize agent behaviors
+        generator_behavior = Generator(
+            assembler=assembler_handle,
+            config=generator_config,
+            ray_address=ray_address,
+        )
+        assembler_behavior = Assembler(
+            validator=validator_handle,
+            config=assembler_config,
+            ray_address=ray_address,
+        )
+        validator_behavior = Validator(
+            assembler=assembler_handle,
+            database=database_handle,
+            config=validator_config,
+            ray_address=ray_address,
+        )
+        database_behavior = Database(
+            generator_handle,
+            ray_address=ray_address,
+        )
+        logger.info("Initialized agent behaviors")
+
+        # Launch agents using preregistered IDs
+        manager.launch(generator_behavior, agent_id=generator_id)
+        manager.launch(assembler_behavior, agent_id=assembler_id)
+        manager.launch(validator_behavior, agent_id=validator_id)
+        manager.launch(database_behavior, agent_id=database_id)
+
+        try:
+            manager.wait(validator_id)
+        except KeyboardInterrupt:
+            # Exiting the context manager will cause the agents to be shutdown.
+            logger.info("Requesting validator to shutdown...")
+            manager.shutdown(validator_id, blocking=True)
+
+        logger.info("Shutting down remaining agents...")
+    logger.info("All agents completed!")
 
 
 def main() -> int:
@@ -262,9 +335,7 @@ def main() -> int:
         lammps_command=compute.lammps_cmd,
         lammps_environ=compute.lammps_env,
         lmp_sims_root_path=(
-            "/dev/shm/lmp_run"
-            if args.lammps_on_ramdisk
-            else str(run_dir / "lmp_run")
+            "/dev/shm/lmp_run" if args.lammps_on_ramdisk else str(run_dir / "lmp_run")
         ),
         max_queue_depth=8 * compute.num_validator_workers,
         num_workers=compute.num_validator_workers,
@@ -274,55 +345,44 @@ def main() -> int:
     )
     logger.info("Initialized agent configs")
 
-    ray.init(args.ray_address, configure_logging=False)
+    # Launch MongoDB as a subprocess
+    mongo_dir = run_dir / "db"
+    mongo_dir.mkdir(parents=True)
+    mongo_proc = subprocess.Popen(
+        f"mongod --wiredTigerCacheSizeGB 4 --dbpath {mongo_dir.absolute()} "
+        f"--logpath {(run_dir / 'mongo.log').absolute()}".split(),
+        stderr=(run_dir / "mongo.err").open("w"),
+    )
 
-    with Manager(
-        exchange=ThreadExchange(),
-        launcher=ThreadLauncher(),
-    ) as manager:
-        # Register agents
-        generator_id = manager.exchange.create_agent()
-        assembler_id = manager.exchange.create_agent()
-        validator_id = manager.exchange.create_agent()
+    ray.init(
+        args.ray_address,
+        configure_logging=True,
+        logging_level=args.log_level,
+        log_to_driver=False,
+    )
 
-        # Construct unbound handles to share with agent behaviors
-        assembler_handle = manager.exchange.create_handle(assembler_id)
-        validator_handle = manager.exchange.create_handle(validator_id)
-
-        # Intialize agent behaviors
-        generator_behavior = Generator(
-            assembler=assembler_handle,
-            config=generator_config,
+    try:
+        run(
+            generator_config=generator_config,
+            assembler_config=assembler_config,
+            validator_config=validator_config,
             ray_address=args.ray_address,
+            logger=logger,
         )
-        assembler_behavior = Assembler(
-            validator=validator_handle,
-            config=assembler_config,
-            ray_address=args.ray_address,
-        )
-        validator_behavior = Validator(
-            assembler=assembler_handle,
-            config=validator_config,
-            ray_address=args.ray_address,
-        )
-        logger.info("Initialized agent behaviors")
-
-        # Launch agents using preregistered IDs
-        manager.launch(generator_behavior, agent_id=generator_id)
-        manager.launch(assembler_behavior, agent_id=assembler_id)
-        manager.launch(validator_behavior, agent_id=validator_id)
-
+    except Exception:
+        logger.exception("Workflow run failed!")
+    finally:
+        mongo_proc.terminate()
         try:
-            manager.wait(validator_id)
-        except KeyboardInterrupt:
-            # Exiting the context manager will cause the agents to be shutdown.
-            logger.info("Requesting validator to shutdown...")
-            manager.shutdown(validator_id, blocking=True)
+            mongo_proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            logger.exception("Timeout waiting for MongoDB shutdown. Killing...")
+            mongo_proc.kill()
+        else:
+            logger.info("MongoDB shutdown")
 
-        logger.info("Shutting down remaining agents...")
-    logger.info("All agents completed!")
-    ray.shutdown()
-    logger.info("Ray shutdown")
+        ray.shutdown()
+        logger.info("Ray shutdown")
 
     return 0
 

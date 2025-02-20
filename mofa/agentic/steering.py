@@ -19,12 +19,14 @@ from threading import Semaphore
 from typing import Any
 
 import ase
+import pymongo
 import ray
 from aeris.behavior import action
 from aeris.behavior import Behavior
 from aeris.behavior import loop
 from aeris.handle import Handle
 
+from mofa import db as mofadb
 from mofa.agentic.config import AssemblerConfig
 from mofa.agentic.config import GeneratorConfig
 from mofa.agentic.config import ValidatorConfig
@@ -60,27 +62,50 @@ class MOFABehavior(Behavior):
 
 
 class Database(MOFABehavior):
-    def __init__(self, generator: Handle[Generator], **kwargs: Any) -> None:
+    def __init__(
+        self,
+        generator: Handle[Generator],
+        *,
+        mongo_host: str = "localhost",
+        mongo_port: int = 27017,
+        **kwargs: Any,
+    ) -> None:
+        self.generator = generator
+        self.mongo_host = mongo_host
+        self.mongo_port = mongo_port
         super().__init__(logger_name="Database", **kwargs)
 
-    @loop
-    def periodic_retrain(self, shutdown: Event) -> None:
-        # Waits for sufficient records to be created and then invokes the
-        # retrain action on the Generator agent with the top-performing
-        # records (either by stability or capacity). This blocks on the
-        # retraining so that multiple retrains are not performed at same time.
-        ...
+    def setup(self) -> None:
+        self.client = pymongo.MongoClient(
+            host=self.mongo_host,
+            port=self.mongo_port,
+        )
+        self.collection = mofadb.initialize_database(self.client)
+        super().setup()
+
+    def shutdown(self) -> None:
+        self.client.close()
+        super().shutdown()
+
+    # @loop
+    # def periodic_retrain(self, shutdown: Event) -> None:
+    #     # Waits for sufficient records to be created and then invokes the
+    #     # retrain action on the Generator agent with the top-performing
+    #     # records (either by stability or capacity). This blocks on the
+    #     # retraining so that multiple retrains are not performed at same time.
+    #     ...
 
     @action
-    def create_record(self) -> None:
+    def create_record(self, record: MOFRecord) -> None:
         # Create a MOF record. This is invoked by the validator to store
         # records for all validated MOFs.
-        ...
+        mofadb.create_records(self.collection, [record])
+        self.logger.info("Created database record for %r", record.name)
 
     @action
     def update_record(self) -> None:
         # Update a MOF record with the gas capacity computed by the Estimator.
-        ...
+        pass
 
 
 class Generator(MOFABehavior):
@@ -123,7 +148,8 @@ class Generator(MOFABehavior):
             ray.cancel(task)
             cancelled += 1
         self.logger.info(
-            "Cancelled %s generate-ligands task(s) after shutdown", cancelled,
+            "Cancelled %s generate-ligands task(s) after shutdown",
+            cancelled,
         )
 
         cancelled = 0
@@ -131,7 +157,8 @@ class Generator(MOFABehavior):
             ray.cancel(task)
             cancelled += 1
         self.logger.info(
-            "Cancelled %s process-ligands task(s) after shutdown", cancelled,
+            "Cancelled %s process-ligands task(s) after shutdown",
+            cancelled,
         )
 
     @loop
@@ -187,7 +214,8 @@ class Generator(MOFABehavior):
                     # TODO: this could be passed as ref to next task
                     batch = ray.get(batch_ref)
                     self.logger.info(
-                        "Received generate-ligands batch (size=%d)", len(batch),
+                        "Received generate-ligands batch (size=%d)",
+                        len(batch),
                     )
                     next_task = process_ligands_task.remote(batch)
                     self.logger.info(
@@ -274,7 +302,8 @@ class Assembler(MOFABehavior):
             ray.cancel(task)
             cancelled += 1
         self.logger.info(
-            "Cancelled %s assemble-ligands task(s) after shutdown", cancelled,
+            "Cancelled %s assemble-ligands task(s) after shutdown",
+            cancelled,
         )
 
     @action
@@ -306,9 +335,7 @@ class Assembler(MOFABehavior):
 
             # TODO: handle dictionary resizing here in a better fashion than
             # copying the dict
-            candidates = sum(
-                len(q) for q in self.assembly_queues.copy().values()
-            )
+            candidates = sum(len(q) for q in self.assembly_queues.copy().values())
             if (
                 candidates < self.config.min_ligand_candidates
                 # assemble_many() requires 2 COO and 1 cyano ligands
@@ -318,9 +345,7 @@ class Assembler(MOFABehavior):
                 self.assembly_count.release()
                 continue
 
-            ligand_options = {
-                k: list(v) for k, v in self.assembly_queues.items()
-            }
+            ligand_options = {k: list(v) for k, v in self.assembly_queues.items()}
             task = assemble_mofs_task.remote(
                 ligand_options=ligand_options,
                 nodes=self.config.node_templates,
@@ -369,15 +394,17 @@ class Validator(MOFABehavior):
     def __init__(
         self,
         assembler: Handle[Assembler],
+        database: Handle[Database],
         config: ValidatorConfig,
         **kwargs: Any,
     ) -> None:
         self.assembler = assembler
+        self.database = database
         self.config = config
         self.runner = LAMMPSRunner(
             lammps_command=config.lammps_command,
             lmp_sims_root_path=config.lmp_sims_root_path,
-            lammps_environ=config.lammps_environ,
+            lammps_environ=config.lammps_environ.copy(),
             delete_finished=config.delete_finished,
         )
         self.simulations_budget = config.simulation_budget
@@ -416,10 +443,7 @@ class Validator(MOFABehavior):
 
     def _check_queue_depth(self, timeout: float) -> None:
         # TODO: lock this to prevent race conditions?
-        if (
-            len(self.validator_queue) > self.queue_threshold
-            and self.assembler_enabled
-        ):
+        if len(self.validator_queue) > self.queue_threshold and self.assembler_enabled:
             self.assembler.action("disable_assembly").result(timeout=timeout)
             self.assembler_enabled = False
         elif (
@@ -435,7 +459,8 @@ class Validator(MOFABehavior):
         for mof in mofs:
             self.validator_queue.append(mof)
         self.logger.info(
-            "Added mofs to validation queue (count=%d)", len(mofs),
+            "Added mofs to validation queue (count=%d)",
+            len(mofs),
         )
         self._check_queue_depth(timeout=5)
 
@@ -478,7 +503,8 @@ class Validator(MOFABehavior):
                 report_frequency=self.config.report_frequency,
             )
             self.logger.info(
-                "Submitted validate-structures task (name=%s)", record.name,
+                "Submitted validate-structures task (name=%s)",
+                record.name,
             )
             future = task.future()
             self.validator_tasks[future] = task
@@ -510,6 +536,7 @@ class Validator(MOFABehavior):
                 record.name,
                 100 * strain,
             )
+            self.database.action("create_record", record).result(timeout=5)
 
     def _validate_task_callback(self, future: Future) -> None:
         self.validator_count.release()
@@ -519,7 +546,9 @@ class Validator(MOFABehavior):
         except Exception as e:
             self.logger.warning("Failure in validate-structures task: %s", e)
             self.logger.debug(
-                "Failure traceback: %r\n%s", e, traceback.format_exc(),
+                "Failure traceback: %r\n%s",
+                e,
+                traceback.format_exc(),
             )
             return
 

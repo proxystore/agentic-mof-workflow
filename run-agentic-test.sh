@@ -27,7 +27,7 @@ python -m mofa.agentic.run \
       --retrain-freq 1 \
       --num-epochs 4 \
       --num-samples 1024 \
-      --gen-batch-size 8096 \
+      --gen-batch-size 64 \
       --simulation-budget 16 \
       --md-timesteps 100000 \
       --md-snapshots 10 \
@@ -38,7 +38,6 @@ python -m mofa.agentic.run \
       --ray-address localhost:6379 \
       --log-level INFO
       # --lammps-on-ramdisk \
-echo Python done
 
 # Shutdown services
 # mpiexec -n ${NNODES} --ppn 1 ./bin/disable_mps_polaris.sh
