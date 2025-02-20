@@ -15,7 +15,10 @@ from mofa.model import LigandDescription
 from mofa.model import LigandTemplate
 from mofa.model import MOFRecord
 from mofa.model import NodeDescription
+from mofa.simulation.cp2k import compute_partial_charges
+from mofa.simulation.cp2k import CP2KRunner
 from mofa.simulation.lammps import LAMMPSRunner
+from mofa.simulation.raspa import RASPARunner
 
 
 @ray.remote(num_cpus=4, num_gpus=1)
@@ -68,3 +71,39 @@ def validate_structure_task(
         timesteps=timesteps,
         report_frequency=report_frequency,
     )
+
+
+# TODO: figure out resource usage
+@ray.remote(num_gpus=1, num_cpus=8)
+def optimize_cells_task(
+    runner: CP2KRunner,
+    mof: MOFRecord,
+    steps: int,
+) -> tuple[str, pathlib.Path]:
+    # Note: we don't use the atoms yet.
+    _, path = runner.run_optimization(mof, steps=steps)
+    return mof.name, path
+
+
+@ray.remote(num_cpus=1)
+def compute_partial_charges_task(
+    name: str,
+    cp2k_path: pathlib.Path,
+) -> tuple[str, ase.Atoms]:
+    atoms = compute_partial_charges(cp2k_path)
+    return name, atoms
+
+
+@ray.remote(num_cpus=1)
+def estimate_adsorption_task(
+    runner: RASPARunner,
+    atoms: ase.Atoms,
+    name: str,
+    timesteps: int,
+) -> tuple[str, float, float]:
+    gas_ads_mean, gas_ads_std = runner.run_GCMC_single(
+        atoms,
+        name,
+        timesteps=timesteps,
+    )
+    return name, gas_ads_mean, gas_ads_std

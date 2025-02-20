@@ -1,10 +1,10 @@
 #!/bin/bash -le
 #PBS -l select=6:system=polaris
 #PBS -l walltime=0:60:00
-#PBS -l filesystems=home:grand:eagle
+#PBS -l filesystems=home:eagle
 #PBS -q debug-scaling
-#PBS -N mofa-test
-#PBS -A examol
+#PBS -N test
+#PBS -A MOFA
 
 hostname
 pwd
@@ -28,16 +28,19 @@ python -m mofa.agentic.run \
       --num-epochs 4 \
       --num-samples 1024 \
       --gen-batch-size 64 \
-      --simulation-budget 16 \
+      --simulation-budget 10000 \
       --md-timesteps 100000 \
       --md-snapshots 10 \
       --retain-lammps \
-      --raspa-timesteps 10000 \
-      --dft-opt-steps 2 \
+      --raspa-timesteps 1000 \
+      --dft-opt-steps 1 \
       --compute-config polaris-single \
       --ray-address localhost:6379 \
       --log-level INFO
       # --lammps-on-ramdisk \
+      # --dft-opt-steps 2 \
+      # --raspa-timesteps 10000 \
+      # --simulation-budget 16 \
 
 # Shutdown services
 # mpiexec -n ${NNODES} --ppn 1 ./bin/disable_mps_polaris.sh

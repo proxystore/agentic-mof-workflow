@@ -19,10 +19,12 @@ from rdkit import RDLogger
 from mofa.agentic.compute import COMPUTE_CONFIGS
 from mofa.agentic.config import AssemblerConfig
 from mofa.agentic.config import GeneratorConfig
+from mofa.agentic.config import OptimizerConfig
 from mofa.agentic.config import ValidatorConfig
 from mofa.agentic.steering import Assembler
 from mofa.agentic.steering import Database
 from mofa.agentic.steering import Generator
+from mofa.agentic.steering import Optimizer
 from mofa.agentic.steering import Validator
 from mofa.model import LigandTemplate
 from mofa.model import NodeDescription
@@ -215,11 +217,12 @@ def configure_logging(run_dir: pathlib.Path, level: str) -> logging.Logger:
     return logging.getLogger("main")
 
 
-def run(
+def run(  # noqa: PLR0913
     *,
     generator_config: GeneratorConfig,
     assembler_config: AssemblerConfig,
     validator_config: ValidatorConfig,
+    optimizer_config: OptimizerConfig,
     ray_address: str,
     logger: logging.Logger,
 ) -> None:
@@ -232,12 +235,14 @@ def run(
         assembler_id = manager.exchange.create_agent()
         validator_id = manager.exchange.create_agent()
         database_id = manager.exchange.create_agent()
+        optimizer_id = manager.exchange.create_agent()
 
         # Construct unbound handles to share with agent behaviors
         assembler_handle = manager.exchange.create_handle(assembler_id)
         validator_handle = manager.exchange.create_handle(validator_id)
         database_handle = manager.exchange.create_handle(database_id)
         generator_handle = manager.exchange.create_handle(generator_id)
+        optimizer_handle = manager.exchange.create_handle(optimizer_id)
 
         # Intialize agent behaviors
         generator_behavior = Generator(
@@ -253,11 +258,17 @@ def run(
         validator_behavior = Validator(
             assembler=assembler_handle,
             database=database_handle,
+            optimizer=optimizer_handle,
             config=validator_config,
             ray_address=ray_address,
         )
         database_behavior = Database(
             generator_handle,
+            ray_address=ray_address,
+        )
+        optimizer_behavior = Optimizer(
+            database=database_handle,
+            config=optimizer_config,
             ray_address=ray_address,
         )
         logger.info("Initialized agent behaviors")
@@ -267,6 +278,7 @@ def run(
         manager.launch(assembler_behavior, agent_id=assembler_id)
         manager.launch(validator_behavior, agent_id=validator_id)
         manager.launch(database_behavior, agent_id=database_id)
+        manager.launch(optimizer_behavior, agent_id=optimizer_id)
 
         try:
             manager.wait(validator_id)
@@ -343,6 +355,14 @@ def main() -> int:
         simulation_budget=args.simulation_budget,
         timesteps=args.md_timesteps,
     )
+    optimizer_config = OptimizerConfig(
+        cp2k_cmd=compute.cp2k_cmd,
+        cp2k_dir=run_dir / "cp2k-runs",
+        cp2k_steps=args.dft_opt_steps,
+        num_workers=compute.num_optimizer_workers,
+        raspa_dir=run_dir / "raspa-runs",
+        raspa_timesteps=args.raspa_timesteps,
+    )
     logger.info("Initialized agent configs")
 
     # Launch MongoDB as a subprocess
@@ -353,19 +373,21 @@ def main() -> int:
         f"--logpath {(run_dir / 'mongo.log').absolute()}".split(),
         stderr=(run_dir / "mongo.err").open("w"),
     )
+    logger.info("Spawned MongoDB process (pid=%d)", mongo_proc.pid)
 
     ray.init(
         args.ray_address,
-        configure_logging=True,
-        logging_level=args.log_level,
+        configure_logging=False,
         log_to_driver=False,
     )
+    logger.info("Initialized Ray (address=%s)", args.ray_address)
 
     try:
         run(
             generator_config=generator_config,
             assembler_config=assembler_config,
             validator_config=validator_config,
+            optimizer_config=optimizer_config,
             ray_address=args.ray_address,
             logger=logger,
         )
@@ -379,10 +401,10 @@ def main() -> int:
             logger.exception("Timeout waiting for MongoDB shutdown. Killing...")
             mongo_proc.kill()
         else:
-            logger.info("MongoDB shutdown")
+            logger.info("Shutdown MongoDB")
 
         ray.shutdown()
-        logger.info("Ray shutdown")
+        logger.info("Shutdown Ray")
 
     return 0
 

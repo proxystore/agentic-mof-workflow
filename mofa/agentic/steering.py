@@ -13,6 +13,7 @@ from collections.abc import Sequence
 from concurrent.futures import Future
 from datetime import datetime
 from queue import Empty
+from queue import PriorityQueue
 from queue import Queue
 from threading import Event
 from threading import Semaphore
@@ -29,15 +30,21 @@ from aeris.handle import Handle
 from mofa import db as mofadb
 from mofa.agentic.config import AssemblerConfig
 from mofa.agentic.config import GeneratorConfig
+from mofa.agentic.config import OptimizerConfig
 from mofa.agentic.config import ValidatorConfig
 from mofa.agentic.task import assemble_mofs_task
+from mofa.agentic.task import compute_partial_charges_task
+from mofa.agentic.task import estimate_adsorption_task
 from mofa.agentic.task import generate_ligands_task
+from mofa.agentic.task import optimize_cells_task
 from mofa.agentic.task import process_ligands_task
 from mofa.agentic.task import validate_structure_task
 from mofa.model import LigandDescription
 from mofa.model import MOFRecord
 from mofa.scoring.geometry import LatticeParameterChange
+from mofa.simulation.cp2k import CP2KRunner
 from mofa.simulation.lammps import LAMMPSRunner
+from mofa.simulation.raspa import RASPARunner
 from mofa.utils.conversions import write_to_string
 
 _ray_init_lock = threading.Lock()
@@ -76,15 +83,17 @@ class Database(MOFABehavior):
         super().__init__(logger_name="Database", **kwargs)
 
     def setup(self) -> None:
+        super().setup()
+
         self.client = pymongo.MongoClient(
             host=self.mongo_host,
             port=self.mongo_port,
         )
         self.collection = mofadb.initialize_database(self.client)
-        super().setup()
 
     def shutdown(self) -> None:
         self.client.close()
+
         super().shutdown()
 
     # @loop
@@ -103,9 +112,10 @@ class Database(MOFABehavior):
         self.logger.info("Created database record for %r", record.name)
 
     @action
-    def update_record(self) -> None:
+    def update_record(self, record: MOFRecord) -> None:
         # Update a MOF record with the gas capacity computed by the Estimator.
-        pass
+        mofadb.update_records(self.collection, [record])
+        self.logger.info("Updated database record for %r", record.name)
 
 
 class Generator(MOFABehavior):
@@ -160,6 +170,8 @@ class Generator(MOFABehavior):
             "Cancelled %s process-ligands task(s) after shutdown",
             cancelled,
         )
+
+        super().shutdown()
 
     @loop
     def submit_generate_ligands(self, shutdown: Event) -> None:
@@ -306,6 +318,8 @@ class Assembler(MOFABehavior):
             cancelled,
         )
 
+        super().shutdown()
+
     @action
     def submit_ligands(
         self,
@@ -395,11 +409,13 @@ class Validator(MOFABehavior):
         self,
         assembler: Handle[Assembler],
         database: Handle[Database],
+        optimizer: Handle[Optimizer],
         config: ValidatorConfig,
         **kwargs: Any,
     ) -> None:
         self.assembler = assembler
         self.database = database
+        self.optimizer = optimizer
         self.config = config
         self.runner = LAMMPSRunner(
             lammps_command=config.lammps_command,
@@ -440,6 +456,8 @@ class Validator(MOFABehavior):
             "Cancelled %d validate-structures task(s) after shutdown",
             cancelled,
         )
+
+        super().shutdown()
 
     def _check_queue_depth(self, timeout: float) -> None:
         # TODO: lock this to prevent race conditions?
@@ -536,6 +554,7 @@ class Validator(MOFABehavior):
                 record.name,
                 100 * strain,
             )
+            self.optimizer.action("submit_mof", record).result(timeout=5)
             self.database.action("create_record", record).result(timeout=5)
 
     def _validate_task_callback(self, future: Future) -> None:
@@ -562,29 +581,156 @@ class Validator(MOFABehavior):
 
 
 class Optimizer(MOFABehavior):
-    def __init__(self, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        database: Handle[Database],
+        config: OptimizerConfig,
+        **kwargs: Any,
+    ) -> None:
+        self.database = database
+        self.config = config
         super().__init__(logger_name="Optimizer", **kwargs)
 
+    def setup(self) -> None:
+        super().setup()
+
+        self.cp2k_runner = CP2KRunner(
+            cp2k_invocation=self.config.cp2k_cmd,
+            run_dir=self.config.cp2k_dir,
+        )
+        self.raspa_runner = RASPARunner(
+            raspa_sims_root_path=self.config.raspa_dir,
+        )
+
+        self.records: dict[str, MOFRecord] = {}
+        self.optimizer_count = threading.Semaphore(self.config.num_workers)
+        self.optimize_queue = PriorityQueue()
+
+        self.optimize_tasks = {}
+        self.compute_tasks = {}
+        self.estimate_tasks = {}
+
+    def shutdown(self) -> None:
+        cancelled = 0
+        for task in self.optimize_tasks.values():
+            ray.cancel(task)
+            cancelled += 1
+        self.logger.info(
+            "Cancelled %s optimize-cells task(s) after shutdown",
+            cancelled,
+        )
+
+        cancelled = 0
+        for task in self.compute_tasks.values():
+            ray.cancel(task)
+            cancelled += 1
+        self.logger.info(
+            "Cancelled %s compute-partial-charges task(s) after shutdown",
+            cancelled,
+        )
+
+        cancelled = 0
+        for task in self.estimate_tasks.values():
+            ray.cancel(task)
+            cancelled += 1
+        self.logger.info(
+            "Cancelled %s estimate-adsorption task(s) after shutdown",
+            cancelled,
+        )
+
+        super().shutdown()
+
     @action
-    def submit_mof(self) -> None:
+    def submit_mof(self, record: MOFRecord) -> None:
         # Submit a MOF to the Optimizer's queue for optimization.
-        ...
+        priority = record.structure_stability["uff"]
+        self.optimize_queue.put((priority, record))
+        self.logger.info("Added mof to optimizer queue (name=%s)", record.name)
 
     @loop
     def submit_optimization(self, shutdown: Event) -> None:
         # Pull from the optimization queue and submit optimization tasks
         # (cp2k). Works with the process_optimization loops to determine
         # the maximum number of tasks to submit.
-        ...
+        while not shutdown.is_set():
+            if not self.optimizer_count.acquire(timeout=1):
+                continue
 
-    @loop
-    def process_optimization(self, shutdown: Event) -> None:
-        # Waits for optimization tasks to complete and submits those MOFs
-        # for adsorption estimation.
-        ...
+            try:
+                _, record = self.optimize_queue.get(timeout=1)
+            except Empty:
+                self.optimizer_count.release()
+                continue
 
-    @loop
-    def process_estimation(self, shutdown: Event) -> None:
-        # Waits for estimation tasks to complete and updates the MOF records
-        # in the Database agent.
-        ...
+            if record.name in self.records:
+                self.optimizer_count.release()
+                continue
+
+            self.records[record.name] = record
+
+            task = optimize_cells_task.remote(
+                runner=self.cp2k_runner,
+                mof=record,
+                steps=self.config.cp2k_steps,
+            )
+            self.logger.info(
+                "Submitted optimize-cells task (name=%s)",
+                record.name,
+            )
+            future = task.future()
+            self.optimize_tasks[future] = task
+            future.add_done_callback(self._optimize_cells_task_callback)
+
+    def _optimize_cells_task_callback(self, future) -> None:
+        self.optimizer_count.release()
+        self.optimize_tasks.pop(future)
+        try:
+            name, cp2k_path = future.result()
+        except Exception:
+            self.logger.exception("Failure in optimize-cells task")
+            return
+
+        self.logger.info("Completed optimize-cells task (name=%s)", name)
+
+        task = compute_partial_charges_task.remote(cp2k_path)
+        self.logger.info("Submitted compute-partial-charges task (name=%s)", name)
+        future = task.future()
+        self.compute_tasks[future] = task
+        future.add_done_callback(self._compute_partial_charges_task_callback)
+
+    def _compute_partial_charges_task_callback(self, future) -> None:
+        self.compute_tasks.pop(future)
+        try:
+            name, atoms = future.result()
+        except Exception:
+            self.logger.exception("Failure in compute-partial-charges task")
+            return
+
+        self.logger.info("Completed compute-partial-charges task (name=%s)", name)
+
+        task = estimate_adsorption_task(
+            self.raspa_runner,
+            atoms,
+            name,
+            timesteps=self.config.raspa_timesteps,
+        )
+        self.logger.info("Submitted estimate-adsorption task (name=%s)", name)
+        future = task.future()
+        self.estimate_tasks[future] = task
+        future.add_done_callback(self._estimate_adsorption_task_callback)
+
+    def _estimate_adsorption_task_callback(self, future) -> None:
+        self.estimate_tasks.pop(future)
+        try:
+            name, storage_mean, storage_std = future.result()
+        except Exception:
+            self.logger.exception("Failure in estimate-adsorption task (name=%s)", name)
+            return
+
+        self.logger.info("Completed estimate-adsorption task (name=%s)", name)
+
+        record = self.records[name]
+        record.gas_storage["C02"] = storage_mean
+        record.times["raspa-done"] = datetime.now()
+
+        self.database.action("update_record", record).result(timeout=5)

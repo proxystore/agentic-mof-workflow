@@ -62,3 +62,13 @@ class ValidatorConfig:
     simulation_budget: int
     """Maximum number of simulations to perform before ending the workflow."""
     timesteps: int
+
+
+@dataclasses.dataclass
+class OptimizerConfig:
+    cp2k_cmd: str
+    cp2k_dir: pathlib.Path
+    cp2k_steps: int
+    num_workers: int
+    raspa_dir: pathlib.Path
+    raspa_timesteps: int
