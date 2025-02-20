@@ -13,7 +13,9 @@ class GeneratorConfig:
     """Configuration for the generation tasks"""
 
     generator_path: pathlib.Path
-    """Path to the DiffLinker model"""
+    """Path to the base DiffLinker model"""
+    model_dir: pathlib.Path
+    """Dir for new DiffLinker models"""
     templates: list[LigandTemplate]
     """The templates being generated"""
     num_workers: int
@@ -30,6 +32,28 @@ class GeneratorConfig:
     @functools.cached_property
     def anchor_types(self) -> set[str]:
         return {x.anchor_type for x in self.templates}
+
+
+@dataclasses.dataclass
+class TrainerConfig:
+    """Configuration for retraining tasks"""
+
+    num_epochs: int
+    """Number of epochs to use for training"""
+    minimum_train_size: int
+    """Trigger retraining after these many computations have completed successfully"""
+    maximum_train_size: int
+    """How many of the top MOFs to train on"""
+    best_fraction: float
+    """Percentile of top MOFs to include in training set"""
+    maximum_strain: float
+    """Only use MOFs with strains below this value in training set"""
+    config_path: str
+    """Path to the generator training configuration"""
+    retrain_dir: pathlib.Path
+    """Retraining directory"""
+    device: str
+    """Torch device for training."""
 
 
 @dataclasses.dataclass

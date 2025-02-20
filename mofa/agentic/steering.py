@@ -4,6 +4,7 @@ import contextlib
 import itertools
 import logging
 import random
+import shutil
 import threading
 import time
 import traceback
@@ -31,6 +32,7 @@ from mofa import db as mofadb
 from mofa.agentic.config import AssemblerConfig
 from mofa.agentic.config import GeneratorConfig
 from mofa.agentic.config import OptimizerConfig
+from mofa.agentic.config import TrainerConfig
 from mofa.agentic.config import ValidatorConfig
 from mofa.agentic.task import assemble_mofs_task
 from mofa.agentic.task import compute_partial_charges_task
@@ -38,6 +40,7 @@ from mofa.agentic.task import estimate_adsorption_task
 from mofa.agentic.task import generate_ligands_task
 from mofa.agentic.task import optimize_cells_task
 from mofa.agentic.task import process_ligands_task
+from mofa.agentic.task import retrain_task
 from mofa.agentic.task import validate_structure_task
 from mofa.model import LigandDescription
 from mofa.model import MOFRecord
@@ -72,18 +75,26 @@ class Database(MOFABehavior):
     def __init__(
         self,
         generator: Handle[Generator],
+        trainer: TrainerConfig,
         *,
         mongo_host: str = "localhost",
         mongo_port: int = 27017,
         **kwargs: Any,
     ) -> None:
         self.generator = generator
+        self.trainer = trainer
         self.mongo_host = mongo_host
         self.mongo_port = mongo_port
+
+        self.lammps_completed = 0
+        self.raspa_completed = 0
+
         super().__init__(logger_name="Database", **kwargs)
 
     def setup(self) -> None:
         super().setup()
+
+        self.retrain = Event()
 
         self.client = pymongo.MongoClient(
             host=self.mongo_host,
@@ -96,13 +107,79 @@ class Database(MOFABehavior):
 
         super().shutdown()
 
-    # @loop
-    # def periodic_retrain(self, shutdown: Event) -> None:
-    #     # Waits for sufficient records to be created and then invokes the
-    #     # retrain action on the Generator agent with the top-performing
-    #     # records (either by stability or capacity). This blocks on the
-    #     # retraining so that multiple retrains are not performed at same time.
-    #     ...
+    @loop
+    def periodic_retrain(self, shutdown: Event) -> None:
+        # Waits for sufficient records to be created and then invokes the
+        # retrain action on the Generator agent with the top-performing
+        # records (either by stability or capacity). This blocks on the
+        # retraining so that multiple retrains are not performed at same time.
+        last_train_size = 0
+
+        while not shutdown.is_set():
+            if not self.retrain.wait(timeout=1):
+                continue
+
+            # Determine how to select best MOFs
+            if self.raspa_completed < self.trainer.minimum_train_size:
+                sort_field = "structure_stability.uff"
+                to_include = min(
+                    int(self.lammps_completed * self.trainer.best_fraction),
+                    self.trainer.maximum_train_size,
+                )
+                sort_order = pymongo.ASCENDING
+            else:
+                sort_field = "gas_storage.CO2"
+                to_include = min(
+                    int(self.raspa_completed * self.trainer.best_fraction),
+                    self.trainer.maximum_train_size,
+                )
+                sort_order = pymongo.DESCENDING
+
+            # Build the query
+            query = defaultdict(dict)
+            query[sort_field] = {"$exists": True}
+            query["structure_stability.uff"] = {"$lt": self.trainer.maximum_strain}
+
+            # Filter out the trajectory to save I/O
+            cursor = (
+                self.collection.find(
+                    filter=query,
+                    projection={"md_trajectory": 0},
+                )
+                .sort(sort_field, sort_order)
+                .limit(to_include)
+            )
+
+            examples = []
+            for record in cursor:
+                record.pop("_id")
+                record["times"] = {}
+                record["md_trajectory"] = {}
+                examples.append(MOFRecord(**record))
+
+            if len(examples) == 0:
+                self.logger.warning("No valid training examples in database")
+                self.retrain.clear()
+                continue
+            if (
+                len(examples) == last_train_size
+                and len(examples) < self.trainer.maximum_train_size
+            ):
+                self.logger.info(
+                    "Number of training samples has not changed since last "
+                    "retraining. Skipping...",
+                )
+                self.retrain.clear()
+                continue
+
+            last_train_size = len(examples)
+
+            future = self.generator.action("retrain", examples)
+            self.retrain.clear()
+            try:
+                future.result()
+            except Exception:
+                self.logger.exception("Error in retrain action")
 
     @action
     def create_record(self, record: MOFRecord) -> None:
@@ -111,11 +188,25 @@ class Database(MOFABehavior):
         mofadb.create_records(self.collection, [record])
         self.logger.info("Created database record for %r", record.name)
 
+        # This is true because the validate-structures task callback
+        # is the only place where this action gets triggered, but if that
+        # changes we'd need a better way to track.
+        self.lammps_completed += 1
+        if self.lammps_completed > self.trainer.minimum_train_size:
+            self.retrain.set()
+
     @action
     def update_record(self, record: MOFRecord) -> None:
         # Update a MOF record with the gas capacity computed by the Estimator.
         mofadb.update_records(self.collection, [record])
         self.logger.info("Updated database record for %r", record.name)
+
+        # This is true because the estimate-adsorption task callback
+        # is the only place where this action gets triggered, but if that
+        # changes we'd need a better way to track.
+        self.raspa_completed += 1
+        if self.raspa_completed > self.trainer.minimum_train_size:
+            self.retrain.set()
 
 
 class Generator(MOFABehavior):
@@ -123,16 +214,20 @@ class Generator(MOFABehavior):
         self,
         assembler: Handle[Assembler],
         config: GeneratorConfig,
+        trainer: TrainerConfig,
         **kwargs: Any,
     ) -> None:
         self.assembler = assembler
         self.config = config
+        self.trainer = trainer
 
         self.initial_model_path = config.generator_path
         self.latest_model_path = config.generator_path
+        self.model_iteration = 0
 
         self.generator_tasks: set[ray.ObjectRef] = set()
         self.process_tasks: dict[Future, ray.ObjectRef] = {}
+        self.retrain_tasks: dict[int, ray.ObjectRef] = {}
 
         super().__init__(logger_name="Generator", **kwargs)
 
@@ -141,6 +236,7 @@ class Generator(MOFABehavior):
 
         self.generator_queue = Queue()
         self.generator_count = Semaphore(value=self.config.num_workers)
+        self.retrain_lock = threading.Lock()
 
         tasks = list(
             itertools.product(
@@ -168,6 +264,15 @@ class Generator(MOFABehavior):
             cancelled += 1
         self.logger.info(
             "Cancelled %s process-ligands task(s) after shutdown",
+            cancelled,
+        )
+
+        cancelled = 0
+        for task in self.retrain_tasks.values():
+            ray.cancel(task)
+            cancelled += 1
+        self.logger.info(
+            "Cancelled %s retrain task(s) after shutdown",
             cancelled,
         )
 
@@ -199,10 +304,12 @@ class Generator(MOFABehavior):
                 device=self.config.device,
             )
             self.logger.info(
-                "Submitted generate-ligands task (type=%s size=%d, samples=%d)",
+                "Submitted generate-ligands task (type=%s size=%d, "
+                "samples=%d, model=%d)",
                 ligand.anchor_type,
                 size,
                 self.config.num_samples,
+                self.model_iteration,
             )
             self.generator_tasks.add(task)
             # Push this generation task back on the queue
@@ -242,6 +349,8 @@ class Generator(MOFABehavior):
         self.process_tasks.pop(future)
         try:
             valid_ligands, all_ligands = future.result()
+        except ray.exceptions.TaskCancelledError:
+            self.logger.warning("Cancelled process-ligands task")
         except Exception:
             self.logger.exception("Failure in process-ligands task")
             return
@@ -276,12 +385,51 @@ class Generator(MOFABehavior):
         else:
             self.logger.info("Submitted ligands to assembler")
 
+    def _retrain(self, examples: list[MOFRecord]) -> None:
+        version = self.model_iteration + 1
+        retrain_dir = self.trainer.retrain_dir / f"model-v{version}"
+        retrain_dir.mkdir(parents=True)
+
+        task = retrain_task.remote(
+            starting_model=self.initial_model_path,
+            run_directory=retrain_dir,
+            config_path=self.trainer.config_path,
+            examples=examples,
+            num_epochs=self.trainer.num_epochs,
+            device=self.trainer.device,
+        )
+        future = task.future()
+        self.retrain_tasks[version] = task
+        self.logger.info(
+            "Submitted retrain task (version=%d, path=%s)",
+            version,
+            retrain_dir,
+        )
+
+        try:
+            path = future.result()
+        except ray.exceptions.TaskCancelledError:
+            self.logger.warning("Cancelled retrain task")
+        except Exception:
+            self.logger.exception("Error in retrain task")
+        else:
+            new_model_path = self.config.model_dir / f"model-v{version}.ckpt"
+            self.config.model_dir.mkdir(exist_ok=True, parents=True)
+            shutil.copyfile(path, new_model_path)
+            self.model_iteration = version
+            self.latest_model_path = new_model_path
+            self.logger.info(
+                "Received retrain task (version=%d, path=%s)",
+                version,
+                new_model_path,
+            )
+        finally:
+            shutil.rmtree(retrain_dir)
+
     @action
-    def retrain(self) -> None:
-        # Retrain the model on this set of data and store the retrained
-        # for use by the generate_ligands loop (via a callback on the future)
-        # of the retraining tasks. This action does not block on training.
-        ...
+    def retrain(self, examples: list[MOFRecord]) -> None:
+        with self.retrain_lock:
+            return self._retrain(examples)
 
 
 class Assembler(MOFABehavior):
@@ -376,6 +524,8 @@ class Assembler(MOFABehavior):
         self.assembly_tasks.pop(future)
         try:
             mofs = future.result()
+        except ray.exceptions.TaskCancelledError:
+            self.logger.warning("Cancelled assemble-mofs task")
         except Exception:
             self.logger.exception("Failure in assemble-mofs task")
             return
@@ -562,6 +712,8 @@ class Validator(MOFABehavior):
         self.validator_tasks.pop(future)
         try:
             record, frames = future.result()
+        except ray.exceptions.TaskCancelledError:
+            self.logger.warning("Cancelled validate-structures task")
         except Exception as e:
             self.logger.warning("Failure in validate-structures task: %s", e)
             self.logger.debug(
@@ -686,6 +838,8 @@ class Optimizer(MOFABehavior):
         self.optimize_tasks.pop(future)
         try:
             name, cp2k_path = future.result()
+        except ray.exceptions.TaskCancelledError:
+            self.logger.warning("Cancelled optimize-cells task")
         except Exception:
             self.logger.exception("Failure in optimize-cells task")
             return
@@ -702,6 +856,8 @@ class Optimizer(MOFABehavior):
         self.compute_tasks.pop(future)
         try:
             name, atoms = future.result()
+        except ray.exceptions.TaskCancelledError:
+            self.logger.warning("Cancelled compute-partial-charges task")
         except Exception:
             self.logger.exception("Failure in compute-partial-charges task")
             return
@@ -723,8 +879,10 @@ class Optimizer(MOFABehavior):
         self.estimate_tasks.pop(future)
         try:
             name, storage_mean, storage_std = future.result()
+        except ray.exceptions.TaskCancelledError:
+            self.logger.warning("Cancelled estimate-adsorption task")
         except Exception:
-            self.logger.exception("Failure in estimate-adsorption task (name=%s)", name)
+            self.logger.exception("Failure in estimate-adsorption task")
             return
 
         self.logger.info("Completed estimate-adsorption task (name=%s)", name)

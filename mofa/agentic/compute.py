@@ -16,14 +16,16 @@ class ComputeConfig:
 
 @dataclasses.dataclass(kw_only=True)
 class PolarisSingleNode(ComputeConfig):
+    # retrain tasks get 1 GPU and 8 CPUs
+    num_retrain_workers = 1
     # generate-ligands tasks get 1 GPU and 4 CPUs
     num_generator_workers = 2
     # assemble-ligands tasks get 1 CPU
     num_assembly_workers = 8
     # validate-structures get 0.5 GPUs and 2 CPUs
-    num_validator_workers = 2
-    # TODO: ...
-    num_optimizer_workers = 1
+    num_validator_workers = 1
+    # optimize-cells get 1 GPU and 8 CPUs
+    num_optimizer_workers = 0
     torch_device = "cuda"
     cp2k_cmd = (
         "module restore && "

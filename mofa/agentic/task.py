@@ -11,6 +11,7 @@ from more_itertools import batched
 from mofa.assembly.assemble import assemble_many
 from mofa.assembly.validate import process_ligands
 from mofa.generator import run_generator
+from mofa.generator import train_generator
 from mofa.model import LigandDescription
 from mofa.model import LigandTemplate
 from mofa.model import MOFRecord
@@ -107,3 +108,25 @@ def estimate_adsorption_task(
         timesteps=timesteps,
     )
     return name, gas_ads_mean, gas_ads_std
+
+
+@ray.remote(num_cpus=8, num_gpus=1)
+def retrain_task(  # noqa: PLR0913
+    *,
+    starting_model: str | pathlib.Path | None,
+    run_directory: pathlib.Path,
+    config_path: str | pathlib.Path,
+    examples: list[MOFRecord],
+    num_epochs: int = 10,
+    device: str = "cpu",
+    strategy: str | None = None,
+) -> pathlib.Path:
+    return train_generator(
+        starting_model=starting_model,
+        run_directory=run_directory,
+        config_path=config_path,
+        examples=examples,
+        num_epochs=num_epochs,
+        device=device,
+        strategy=strategy,
+    )

@@ -22,13 +22,13 @@ python -m mofa.agentic.run \
       --ligand-templates input-files/zn-paddle-pillar/template_*_prompt.yml \
       --generator-path models/geom-300k/geom_difflinker_epoch=997_new.ckpt \
       --generator-config-path models/geom-300k/config-tf32-a100.yaml \
-      --maximum-train-size 8192 \
-      --maximum-strain 0.5 \
+      --maximum-train-size 2048 \
+      --maximum-strain 100000 \
       --retrain-freq 1 \
       --num-epochs 4 \
       --num-samples 1024 \
       --gen-batch-size 64 \
-      --simulation-budget 10000 \
+      --simulation-budget 64 \
       --md-timesteps 100000 \
       --md-snapshots 10 \
       --retain-lammps \
@@ -37,6 +37,7 @@ python -m mofa.agentic.run \
       --compute-config polaris-single \
       --ray-address localhost:6379 \
       --log-level INFO
+      # --maximum-strain 0.5 \
       # --lammps-on-ramdisk \
       # --dft-opt-steps 2 \
       # --raspa-timesteps 10000 \

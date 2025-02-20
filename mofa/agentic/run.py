@@ -20,6 +20,7 @@ from mofa.agentic.compute import COMPUTE_CONFIGS
 from mofa.agentic.config import AssemblerConfig
 from mofa.agentic.config import GeneratorConfig
 from mofa.agentic.config import OptimizerConfig
+from mofa.agentic.config import TrainerConfig
 from mofa.agentic.config import ValidatorConfig
 from mofa.agentic.steering import Assembler
 from mofa.agentic.steering import Database
@@ -220,6 +221,7 @@ def configure_logging(run_dir: pathlib.Path, level: str) -> logging.Logger:
 def run(  # noqa: PLR0913
     *,
     generator_config: GeneratorConfig,
+    trainer_config: TrainerConfig,
     assembler_config: AssemblerConfig,
     validator_config: ValidatorConfig,
     optimizer_config: OptimizerConfig,
@@ -248,6 +250,7 @@ def run(  # noqa: PLR0913
         generator_behavior = Generator(
             assembler=assembler_handle,
             config=generator_config,
+            trainer=trainer_config,
             ray_address=ray_address,
         )
         assembler_behavior = Assembler(
@@ -264,6 +267,7 @@ def run(  # noqa: PLR0913
         )
         database_behavior = Database(
             generator_handle,
+            trainer=trainer_config,
             ray_address=ray_address,
         )
         optimizer_behavior = Optimizer(
@@ -327,12 +331,23 @@ def main() -> int:
 
     generator_config = GeneratorConfig(
         generator_path=args.generator_path,
+        model_dir=run_dir / "models",
         templates=templates,
         num_workers=compute.num_generator_workers,
         atom_counts=args.molecule_sizes,
         batch_size=args.gen_batch_size,
         device=compute.torch_device,
         num_samples=args.num_samples,
+    )
+    trainer_config = TrainerConfig(
+        maximum_train_size=args.maximum_train_size,
+        num_epochs=args.num_epochs,
+        minimum_train_size=args.retrain_freq,
+        best_fraction=args.best_fraction,
+        maximum_strain=args.maximum_strain,
+        config_path=args.generator_config_path,
+        retrain_dir=run_dir / "retraining",
+        device=compute.torch_device,
     )
     assembler_config = AssemblerConfig(
         max_queue_depth=50 * compute.num_generator_workers,
@@ -385,6 +400,7 @@ def main() -> int:
     try:
         run(
             generator_config=generator_config,
+            trainer_config=trainer_config,
             assembler_config=assembler_config,
             validator_config=validator_config,
             optimizer_config=optimizer_config,
