@@ -54,21 +54,14 @@ _ray_init_lock = threading.Lock()
 
 
 class MOFABehavior(Behavior):
-    def __init__(self, *, logger_name: str, ray_address: str) -> None:
+    def __init__(self, *, logger_name: str) -> None:
         self.logger = logging.getLogger(logger_name)
-        self.ray_address = ray_address
 
     def setup(self) -> None:
         pass
-        # with _ray_init_lock:
-        #     if not ray.is_initialized():
-        #         ray.init(self.ray_address, configure_logging=False)
 
     def shutdown(self) -> None:
         pass
-        # with _ray_init_lock:
-        #     if ray.is_initialized():
-        #         ray.shutdown()
 
 
 class Database(MOFABehavior):
