@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 import pathlib
-from collections.abc import Generator
 from collections.abc import Sequence
 
 import ase
-import ray
 from more_itertools import batched
+from parsl import python_app
 
 from mofa.assembly.assemble import assemble_many
 from mofa.assembly.validate import process_ligands
@@ -22,7 +21,7 @@ from mofa.simulation.lammps import LAMMPSRunner
 from mofa.simulation.raspa import RASPARunner
 
 
-@ray.remote(num_cpus=4, num_gpus=1)
+@python_app
 def generate_ligands_task(  # noqa: PLR0913
     model: str | pathlib.Path,
     templates: Sequence[LigandTemplate],
@@ -31,7 +30,11 @@ def generate_ligands_task(  # noqa: PLR0913
     n_samples: int = 1,
     n_steps: int | None = None,
     device: str = "cpu",
-) -> Generator[tuple[LigandDescription, ...], None, None]:
+) -> tuple[list[LigandDescription], str]:
+    valid_ligands: list[LigandDescription] = []
+    assert len(templates) == 1
+    anchor_type = templates[0].anchor_type
+
     generator = run_generator(
         model=model,
         templates=templates,
@@ -40,17 +43,14 @@ def generate_ligands_task(  # noqa: PLR0913
         n_steps=n_steps,
         device=device,
     )
-    yield from batched(generator, batch_size)
+    for batch in batched(generator, batch_size):
+        ligands, _ = process_ligands(batch)
+        valid_ligands.extend(ligands)
+
+    return ligands, anchor_type
 
 
-@ray.remote(num_cpus=1)
-def process_ligands_task(
-    ligands: Sequence[LigandDescription],
-) -> tuple[list[LigandDescription], list[dict]]:
-    return process_ligands(ligands)
-
-
-@ray.remote(num_cpus=1)
+@python_app
 def assemble_mofs_task(
     ligand_options: dict[str, Sequence[LigandDescription]],
     nodes: Sequence[NodeDescription],
@@ -60,7 +60,7 @@ def assemble_mofs_task(
     return assemble_many(ligand_options, nodes, to_make, attempts)
 
 
-@ray.remote(num_cpus=4, num_gpus=0.5)
+@python_app
 def validate_structure_task(
     runner: LAMMPSRunner,
     mof: MOFRecord,
@@ -74,28 +74,19 @@ def validate_structure_task(
     )
 
 
-# TODO: figure out resource usage
-@ray.remote(num_gpus=1, num_cpus=8)
-def optimize_cells_task(
+@python_app
+def optimize_cells_and_compute_charges_task(
     runner: CP2KRunner,
     mof: MOFRecord,
     steps: int,
-) -> tuple[str, pathlib.Path]:
+) -> tuple[MOFRecord, ase.Atoms]:
     # Note: we don't use the atoms yet.
     _, path = runner.run_optimization(mof, steps=steps)
-    return mof.name, path
+    atoms = compute_partial_charges(path)
+    return mof, atoms
 
 
-@ray.remote(num_cpus=1)
-def compute_partial_charges_task(
-    name: str,
-    cp2k_path: pathlib.Path,
-) -> tuple[str, ase.Atoms]:
-    atoms = compute_partial_charges(cp2k_path)
-    return name, atoms
-
-
-@ray.remote(num_cpus=1)
+@python_app
 def estimate_adsorption_task(
     runner: RASPARunner,
     atoms: ase.Atoms,
@@ -110,7 +101,7 @@ def estimate_adsorption_task(
     return name, gas_ads_mean, gas_ads_std
 
 
-@ray.remote(num_cpus=8, num_gpus=1)
+@python_app
 def retrain_task(  # noqa: PLR0913
     *,
     starting_model: str | pathlib.Path | None,

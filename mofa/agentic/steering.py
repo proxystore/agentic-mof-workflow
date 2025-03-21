@@ -3,8 +3,10 @@ from __future__ import annotations
 import contextlib
 import itertools
 import logging
+import pathlib
 import random
 import shutil
+import subprocess
 import threading
 import time
 import traceback
@@ -21,8 +23,8 @@ from threading import Semaphore
 from typing import Any
 
 import ase
+import parsl
 import pymongo
-import ray
 from aeris.behavior import action
 from aeris.behavior import Behavior
 from aeris.behavior import loop
@@ -30,16 +32,17 @@ from aeris.handle import Handle
 
 from mofa import db as mofadb
 from mofa.agentic.config import AssemblerConfig
+from mofa.agentic.config import DatabaseConfig
+from mofa.agentic.config import EstimatorConfig
 from mofa.agentic.config import GeneratorConfig
 from mofa.agentic.config import OptimizerConfig
 from mofa.agentic.config import TrainerConfig
 from mofa.agentic.config import ValidatorConfig
+from mofa.agentic.parsl import get_parsl_config
 from mofa.agentic.task import assemble_mofs_task
-from mofa.agentic.task import compute_partial_charges_task
 from mofa.agentic.task import estimate_adsorption_task
 from mofa.agentic.task import generate_ligands_task
-from mofa.agentic.task import optimize_cells_task
-from mofa.agentic.task import process_ligands_task
+from mofa.agentic.task import optimize_cells_and_compute_charges_task
 from mofa.agentic.task import retrain_task
 from mofa.agentic.task import validate_structure_task
 from mofa.model import LigandDescription
@@ -49,8 +52,6 @@ from mofa.simulation.cp2k import CP2KRunner
 from mofa.simulation.lammps import LAMMPSRunner
 from mofa.simulation.raspa import RASPARunner
 from mofa.utils.conversions import write_to_string
-
-_ray_init_lock = threading.Lock()
 
 
 class MOFABehavior(Behavior):
@@ -68,16 +69,13 @@ class Database(MOFABehavior):
     def __init__(
         self,
         generator: Handle[Generator],
+        config: DatabaseConfig,
         trainer: TrainerConfig,
-        *,
-        mongo_host: str = "localhost",
-        mongo_port: int = 27017,
         **kwargs: Any,
     ) -> None:
         self.generator = generator
+        self.config = config
         self.trainer = trainer
-        self.mongo_host = mongo_host
-        self.mongo_port = mongo_port
 
         self.lammps_completed = 0
         self.raspa_completed = 0
@@ -87,15 +85,35 @@ class Database(MOFABehavior):
     def setup(self) -> None:
         super().setup()
 
+        run_dir = pathlib.Path(self.config.run_dir)
+        mongo_dir = run_dir / "db"
+        mongo_dir.mkdir(parents=True)
+        self.mongo_proc = subprocess.Popen(
+            f"mongod --wiredTigerCacheSizeGB 4 --dbpath {mongo_dir.absolute()} "
+            f"--logpath {(run_dir / 'mongo.log').absolute()}".split(),
+            stderr=(run_dir / "mongo.err").open("w"),
+        )
+        time.sleep(5)
+        self.logger.info("Spawned MongoDB process (pid=%d)", self.mongo_proc.pid)
+
         self.retrain = Event()
 
         self.client = pymongo.MongoClient(
-            host=self.mongo_host,
-            port=self.mongo_port,
+            host=self.config.mongo_host,
+            port=self.config.mongo_port,
         )
         self.collection = mofadb.initialize_database(self.client)
 
     def shutdown(self) -> None:
+        self.mongo_proc.terminate()
+        try:
+            self.mongo_proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            self.logger.exception("Timeout waiting for MongoDB shutdown. Killing...")
+            self.mongo_proc.kill()
+        else:
+            self.logger.info("Shutdown MongoDB")
+
         self.client.close()
 
         super().shutdown()
@@ -218,9 +236,8 @@ class Generator(MOFABehavior):
         self.latest_model_path = config.generator_path
         self.model_iteration = 0
 
-        self.generator_tasks: set[ray.ObjectRef] = set()
-        self.process_tasks: dict[Future, ray.ObjectRef] = {}
-        self.retrain_tasks: dict[int, ray.ObjectRef] = {}
+        self.generator_tasks: set[Future] = set()
+        self.retrain_tasks: dict[int, Future] = {}
 
         super().__init__(logger_name="Generator", **kwargs)
 
@@ -242,31 +259,13 @@ class Generator(MOFABehavior):
             self.generator_queue.put(task)
 
     def shutdown(self) -> None:
-        cancelled = 0
-        for task in self.generator_tasks:
-            ray.cancel(task)
-            cancelled += 1
-        self.logger.info(
-            "Cancelled %s generate-ligands task(s) after shutdown",
-            cancelled,
+        self.logger.warning(
+            "There are %s remaining generate-ligands task(s) after shutdown",
+            len(self.generator_tasks),
         )
-
-        cancelled = 0
-        for task in self.process_tasks.values():
-            ray.cancel(task)
-            cancelled += 1
-        self.logger.info(
-            "Cancelled %s process-ligands task(s) after shutdown",
-            cancelled,
-        )
-
-        cancelled = 0
-        for task in self.retrain_tasks.values():
-            ray.cancel(task)
-            cancelled += 1
-        self.logger.info(
-            "Cancelled %s retrain task(s) after shutdown",
-            cancelled,
+        self.logger.warning(
+            "There are %s remaining retrain task(s) after shutdown",
+            len(self.retrain_tasks),
         )
 
         super().shutdown()
@@ -288,8 +287,7 @@ class Generator(MOFABehavior):
                 continue
 
             ligand = self.config.templates[ligand_id]
-            task = generate_ligands_task.remote(
-                batch_size=self.config.batch_size,
+            task = generate_ligands_task(
                 model=self.latest_model_path,
                 templates=[ligand],
                 n_atoms=size,
@@ -308,59 +306,21 @@ class Generator(MOFABehavior):
             # Push this generation task back on the queue
             self.generator_queue.put((ligand_id, size))
 
-    @loop
-    def submit_process_ligands(self, shutdown: Event) -> None:
-        # Passes batches from generator tasks to process ligands tasks
-        while not shutdown.is_set():
-            # Check which generator tasks have ready batches
-            ready, _ = ray.wait(list(self.generator_tasks), timeout=1)
-            for task in ready:
-                try:
-                    batch_ref = next(task)
-                except StopIteration:
-                    # Task is finished so let another task be submitted.
-                    self.generator_count.release()
-                    self.generator_tasks.remove(task)
-                    self.logger.info("Completed generate-ligands task")
-                else:
-                    # TODO: this could be passed as ref to next task
-                    batch = ray.get(batch_ref)
-                    self.logger.info(
-                        "Received generate-ligands batch (size=%d)",
-                        len(batch),
-                    )
-                    next_task = process_ligands_task.remote(batch)
-                    self.logger.info(
-                        "Submitted process-ligands task (size=%d)",
-                        len(batch),
-                    )
-                    future = next_task.future()
-                    self.process_tasks[future] = next_task
-                    future.add_done_callback(self._process_ligands_callback)
-
-    def _process_ligands_callback(self, future) -> None:
-        self.process_tasks.pop(future)
+    def _generate_ligands_callback(self, future) -> None:
+        self.generator_tasks.remove(future)
         try:
-            valid_ligands, all_ligands = future.result()
-        except ray.exceptions.TaskCancelledError:
-            self.logger.warning("Cancelled process-ligands task")
+            valid_ligands, anchor_type = future.result()
         except Exception:
-            self.logger.exception("Failure in process-ligands task")
+            self.logger.exception("Failure in generate-ligands task")
             return
 
         self.logger.info(
-            "Received process-ligands batch (valid=%s, rate=%.2f%%)",
+            "Received generate-ligands batch (valid=%s)",
             len(valid_ligands),
-            100 * (len(valid_ligands) / len(all_ligands)),
         )
 
         if len(valid_ligands) == 0:
             return
-
-        assert len(all_ligands) > 0
-        # All ligands come from the same batch so they were created by the
-        # same model and therefore have the same anchor type.
-        anchor_type = all_ligands[0]["anchor_type"]
 
         action_future = self.assembler.action(
             "submit_ligands",
@@ -383,7 +343,7 @@ class Generator(MOFABehavior):
         retrain_dir = self.trainer.retrain_dir / f"model-v{version}"
         retrain_dir.mkdir(parents=True)
 
-        task = retrain_task.remote(
+        task = retrain_task(
             starting_model=self.initial_model_path,
             run_directory=retrain_dir,
             config_path=self.trainer.config_path,
@@ -401,8 +361,6 @@ class Generator(MOFABehavior):
 
         try:
             path = future.result()
-        except ray.exceptions.TaskCancelledError:
-            self.logger.warning("Cancelled retrain task")
         except Exception:
             self.logger.exception("Error in retrain task")
         else:
@@ -440,6 +398,13 @@ class Assembler(MOFABehavior):
     def setup(self) -> None:
         super().setup()
 
+        config = get_parsl_config(
+            "local",
+            self.config.run_dir,
+            workers_per_node=self.config.num_workers,
+        )
+        parsl.load(config)
+
         self.assembly_queues = defaultdict(
             lambda: deque(maxlen=self.config.max_queue_depth),
         )
@@ -450,15 +415,12 @@ class Assembler(MOFABehavior):
         self.enabled = threading.Event()
 
     def shutdown(self) -> None:
-        cancelled = 0
-        for task in self.assembly_tasks.values():
-            ray.cancel(task)
-            cancelled += 1
-        self.logger.info(
-            "Cancelled %s assemble-ligands task(s) after shutdown",
-            cancelled,
+        self.logger.warning(
+            "There are %s remaining assemble-ligands task(s) after shutdown",
+            len(self.assembly_tasks),
         )
 
+        parsl.dfk().cleanup()
         super().shutdown()
 
     @action
@@ -501,7 +463,7 @@ class Assembler(MOFABehavior):
                 continue
 
             ligand_options = {k: list(v) for k, v in self.assembly_queues.items()}
-            task = assemble_mofs_task.remote(
+            task = assemble_mofs_task(
                 ligand_options=ligand_options,
                 nodes=self.config.node_templates,
                 to_make=self.config.num_mofs,
@@ -517,8 +479,6 @@ class Assembler(MOFABehavior):
         self.assembly_tasks.pop(future)
         try:
             mofs = future.result()
-        except ray.exceptions.TaskCancelledError:
-            self.logger.warning("Cancelled assemble-mofs task")
         except Exception:
             self.logger.exception("Failure in assemble-mofs task")
             return
@@ -591,13 +551,9 @@ class Validator(MOFABehavior):
         self.processed_mofs = 0
 
     def shutdown(self) -> None:
-        cancelled = 0
-        for task in self.validator_tasks.values():
-            ray.cancel(task)
-            cancelled += 1
         self.logger.info(
-            "Cancelled %d validate-structures task(s) after shutdown",
-            cancelled,
+            "There are %d remaining validate-structures task(s) after shutdown",
+            len(self.validator_tasks),
         )
 
         super().shutdown()
@@ -657,7 +613,7 @@ class Validator(MOFABehavior):
                 self.validator_count.release()
                 continue
 
-            task = validate_structure_task.remote(
+            task = validate_structure_task(
                 runner=self.runner,
                 mof=record,
                 timesteps=self.config.timesteps,
@@ -705,8 +661,6 @@ class Validator(MOFABehavior):
         self.validator_tasks.pop(future)
         try:
             record, frames = future.result()
-        except ray.exceptions.TaskCancelledError:
-            self.logger.warning("Cancelled validate-structures task")
         except Exception as e:
             self.logger.warning("Failure in validate-structures task: %s", e)
             self.logger.debug(
@@ -728,61 +682,38 @@ class Validator(MOFABehavior):
 class Optimizer(MOFABehavior):
     def __init__(
         self,
-        database: Handle[Database],
+        estimator: Handle[Estimator],
         config: OptimizerConfig,
         **kwargs: Any,
     ) -> None:
-        self.database = database
+        self.estimator = estimator
         self.config = config
         super().__init__(logger_name="Optimizer", **kwargs)
 
     def setup(self) -> None:
         super().setup()
 
+        config = get_parsl_config(
+            "polaris",
+            self.config.run_dir,
+        )
+        parsl.load(config)
+
         self.cp2k_runner = CP2KRunner(
             cp2k_invocation=self.config.cp2k_cmd,
             run_dir=self.config.cp2k_dir,
         )
-        self.raspa_runner = RASPARunner(
-            raspa_sims_root_path=self.config.raspa_dir,
-        )
-
         self.records: dict[str, MOFRecord] = {}
         self.optimizer_count = threading.Semaphore(self.config.num_workers)
         self.optimize_queue = PriorityQueue()
-
         self.optimize_tasks = {}
-        self.compute_tasks = {}
-        self.estimate_tasks = {}
 
     def shutdown(self) -> None:
-        cancelled = 0
-        for task in self.optimize_tasks.values():
-            ray.cancel(task)
-            cancelled += 1
-        self.logger.info(
-            "Cancelled %s optimize-cells task(s) after shutdown",
-            cancelled,
+        self.logger.warning(
+            "There are %s remaining optimize-cells task(s) after shutdown",
+            len(self.optimize_tasks),
         )
-
-        cancelled = 0
-        for task in self.compute_tasks.values():
-            ray.cancel(task)
-            cancelled += 1
-        self.logger.info(
-            "Cancelled %s compute-partial-charges task(s) after shutdown",
-            cancelled,
-        )
-
-        cancelled = 0
-        for task in self.estimate_tasks.values():
-            ray.cancel(task)
-            cancelled += 1
-        self.logger.info(
-            "Cancelled %s estimate-adsorption task(s) after shutdown",
-            cancelled,
-        )
-
+        parsl.dfk().cleanup()
         super().shutdown()
 
     @action
@@ -813,7 +744,7 @@ class Optimizer(MOFABehavior):
 
             self.records[record.name] = record
 
-            task = optimize_cells_task.remote(
+            task = optimize_cells_and_compute_charges_task(
                 runner=self.cp2k_runner,
                 mof=record,
                 steps=self.config.cp2k_steps,
@@ -830,50 +761,91 @@ class Optimizer(MOFABehavior):
         self.optimizer_count.release()
         self.optimize_tasks.pop(future)
         try:
-            name, cp2k_path = future.result()
-        except ray.exceptions.TaskCancelledError:
-            self.logger.warning("Cancelled optimize-cells task")
+            record, atoms = future.result()
         except Exception:
             self.logger.exception("Failure in optimize-cells task")
             return
 
-        self.logger.info("Completed optimize-cells task (name=%s)", name)
+        self.logger.info("Completed optimize-cells task (name=%s)", record.name)
 
-        task = compute_partial_charges_task.remote(cp2k_path)
-        self.logger.info("Submitted compute-partial-charges task (name=%s)", name)
-        future = task.future()
-        self.compute_tasks[future] = task
-        future.add_done_callback(self._compute_partial_charges_task_callback)
-
-    def _compute_partial_charges_task_callback(self, future) -> None:
-        self.compute_tasks.pop(future)
+        action_future = self.estimate.submit("submit_atoms", record, atoms)
         try:
-            name, atoms = future.result()
-        except ray.exceptions.TaskCancelledError:
-            self.logger.warning("Cancelled compute-partial-charges task")
+            action_future.result(timeout=5)
+        except TimeoutError:
+            self.logger.warning(
+                "Timeout in submit-atoms action. Is the estimator alive?",
+            )
         except Exception:
-            self.logger.exception("Failure in compute-partial-charges task")
-            return
+            self.logger.exception("Error in submit-atoms action.")
+        else:
+            self.logger.info("Submitted mofs to validator.")
 
-        self.logger.info("Completed compute-partial-charges task (name=%s)", name)
 
-        task = estimate_adsorption_task(
-            self.raspa_runner,
-            atoms,
-            name,
-            timesteps=self.config.raspa_timesteps,
+class Estimator(MOFABehavior):
+    def __init__(
+        self,
+        database: Handle[Database],
+        config: EstimatorConfig,
+        **kwargs: Any,
+    ) -> None:
+        self.database = database
+        self.config = config
+        super().__init__(logger_name="Estimator", **kwargs)
+
+    def on_setup(self) -> None:
+        super().on_setup()
+
+        config = get_parsl_config(
+            "local",
+            self.config.run_dir,
+            workers_per_node=self.config.num_workers,
         )
-        self.logger.info("Submitted estimate-adsorption task (name=%s)", name)
-        future = task.future()
-        self.estimate_tasks[future] = task
-        future.add_done_callback(self._estimate_adsorption_task_callback)
+        parsl.load(config)
+
+        self.raspa_runner = RASPARunner(
+            raspa_sims_root_path=str(self.config.raspa_dir),
+        )
+        self.estimate_queue: Queue[tuple[str, ase.Atoms]] = Queue()
+        self.estimate_tasks = {}
+        self.records: dict[str, MOFRecord] = {}
+
+    def on_shutdown(self) -> None:
+        self.logger.warning(
+            "There are %s remaining estimate-adsorption task(s) after shutdown",
+            len(self.estimate_tasks),
+        )
+        parsl.dfk().cleanup()
+        super().on_shutdown()
+
+    @action
+    def submit_atoms(self, record: MOFRecord, atoms: ase.Atoms) -> None:
+        self.estimate_queue.put((record.name, atoms))
+        self.records[record.name] = record
+        self.logger.info("Added atoms to estimator queue (name=%s)", record.name)
+
+    @loop
+    def submit_estimation(self, shutdown: Event) -> None:
+        while not shutdown.is_set():
+            try:
+                name, atoms = self.estimate_queue.get(timeout=1)
+            except Empty:
+                continue
+
+            task = estimate_adsorption_task(
+                self.raspa_runner,
+                atoms,
+                name,
+                timesteps=self.config.raspa_timesteps,
+            )
+            self.logger.info("Submitted estimate-adsorption task (name=%s)", name)
+            future = task.future()
+            self.estimate_tasks[future] = task
+            future.add_done_callback(self._estimate_adsorption_task_callback)
 
     def _estimate_adsorption_task_callback(self, future) -> None:
         self.estimate_tasks.pop(future)
         try:
             name, storage_mean, storage_std = future.result()
-        except ray.exceptions.TaskCancelledError:
-            self.logger.warning("Cancelled estimate-adsorption task")
         except Exception:
             self.logger.exception("Failure in estimate-adsorption task")
             return

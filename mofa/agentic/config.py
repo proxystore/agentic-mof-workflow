@@ -9,6 +9,13 @@ from mofa.model import NodeDescription
 
 
 @dataclasses.dataclass
+class DatabaseConfig:
+    run_dir: str
+    mongo_host: str = "localhost"
+    mongo_port: int = 27017
+
+
+@dataclasses.dataclass
 class GeneratorConfig:
     """Configuration for the generation tasks"""
 
@@ -22,12 +29,11 @@ class GeneratorConfig:
     """Maximum workers to use for generation."""
     atom_counts: list[int]
     """Number of atoms within a linker to generate"""
-    batch_size: int
-    """Number of ligands to return in each batch"""
     device: str
     """Torch device for inference."""
     num_samples: int
     """Number of molecules to generate at each size"""
+    batch_size: int
 
     @functools.cached_property
     def anchor_types(self) -> set[str]:
@@ -70,6 +76,7 @@ class AssemblerConfig:
     """Number of assembly workers."""
     node_templates: list[NodeDescription]
     """Nodes to be used for assembly."""
+    run_dir: str
 
 
 @dataclasses.dataclass
@@ -94,5 +101,12 @@ class OptimizerConfig:
     cp2k_dir: pathlib.Path
     cp2k_steps: int
     num_workers: int
+    run_dir: str
+
+
+@dataclasses.dataclass
+class EstimatorConfig:
+    num_workers: int
     raspa_dir: pathlib.Path
     raspa_timesteps: int
+    run_dir: str
