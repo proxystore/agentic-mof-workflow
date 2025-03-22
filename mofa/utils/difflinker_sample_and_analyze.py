@@ -4,6 +4,10 @@ import os
 
 
 import torch
+try:
+    import intel_extension_for_pytorch as ipex
+except ImportError:
+    ipex = None
 import numpy as np
 from rdkit import Chem
 
@@ -77,6 +81,10 @@ def main_run(templates: list[LigandTemplate],
 
     # Pull the model from disk, evicting the old one if needed
     ddpm = load_model(model, device)
+
+    # If xpu, optimize
+    if device == "xpu":
+        ddpm = ipex.optimize(ddpm)
 
     if n_steps is not None:
         ddpm.edm.T = n_steps  # otherwise, ddpm.edm.T = 1000 default

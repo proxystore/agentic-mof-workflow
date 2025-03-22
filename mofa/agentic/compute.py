@@ -71,9 +71,8 @@ class FederatedConfig(ComputeConfig):
         # "/lus/eagle/projects/ExaMol/cp2k-2024.1/set_affinity_gpu_polaris.sh "
         "/lus/eagle/projects/ExaMol/cp2k-2024.1/exe/local_cuda/cp2k_shell.psmp "
     )
-    # TODO: aurora version
     lammps_cmd = (
-        "/eagle/MOFA/jgpaul/lammps/build-gpu-nompi-mixed/lmp",
+        "/flare/proxystore/jgpaul/lammps/build/lmp",
         "-sf",
         "gpu",
         "-pk",

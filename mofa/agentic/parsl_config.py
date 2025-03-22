@@ -25,9 +25,10 @@ def get_aurora_config(run_dir: str) -> Config:
     tile_names = [f"{gid}.{tid}" for gid in range(6) for tid in range(2)]
     user_opts = {
         "worker_init": (
-            "module load frameworks; "
-            "conda activate /flare/proxystore/jgpaul/agentic-mof-workflow; "
-            f"cd {run_dir}"
+            "module load frameworks ; "
+            "conda activate /home/jgpaul/envs/mofa ; "
+            "export ZE_FLAT_DEVICE_HIERARCHY=COMPOSITE ; "
+            f"cd /flare/proxystore/jgpaul/agentic-mof-workflow"
         ),
         "scheduler_options": "#PBS -l filesystems=home:flare",
         "account": "proxystore",
@@ -64,7 +65,7 @@ def get_aurora_config(run_dir: str) -> Config:
     )
 
     return Config(
-        executor=[executor],
+        executors=[executor],
         run_dir=run_dir,
         initialize_logging=False,
         retries=0,
@@ -97,13 +98,13 @@ def get_polaris_config(run_dir: str) -> Config:
         "worker_init": (
             "module use /soft/modulefiles; module load conda; "
             "conda activate /eagle/MOFA/jgpaul/agentic-mof-workflow/env; "
-            f"cd {run_dir}"
+            f"cd /eagle/MOFA/jgpaul/agentic-mof-workflow/"
         ),
         "scheduler_options": "#PBS -l filesystems=home:eagle",
         "account": "proxystore",
-        "queue": "debug-scaling",
+        "queue": "debug",
         "walltime": "1:00:00",
-        "nodes_per_block": 3,
+        "nodes_per_block": 1,
         "cpus_per_node": 32,
         "available_accelerators": 4,
     }

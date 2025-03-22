@@ -3,16 +3,19 @@ import os
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
+import torch
 from pytorch_lightning import Trainer, callbacks
 from pytorch_lightning.callbacks import TQDMProgressBar
 from pytorch_lightning.strategies import SingleDeviceStrategy
 
 try:
     import intel_extension_for_pytorch as ipex  # noqa: F401
-    import oneccl_bindings_for_pytorch  # noqa: F401
+    if torch.xpu.is_available():
+        import oneccl_bindings_for_pytorch  # noqa: F401
 except ImportError:
     pass
 
+from mofa.utils.lightning import XPUAccelerator
 from mofa.utils.src.const import NUMBER_OF_ATOM_TYPES, GEOM_NUMBER_OF_ATOM_TYPES
 from mofa.utils.src.lightning import DDPM
 from mofa.utils.src.utils import disable_rdkit_logging
@@ -153,9 +156,11 @@ def main(
                 context_node_nf += 1
 
             # Lock XPU to single device for now
-            strategy = 'ddp_spawn' if args.strategy is None else SingleDeviceStrategy(device='xpu')
+            strategy = 'ddp_spawn' if args.strategy is None else args.strategy
             if args.device == 'xpu':
-                strategy = SingleDeviceStrategy(device='xpu')
+                accelerator = XPUAccelerator()
+            else:
+                accelerator = args.device
 
             checkpoint_callback = [callbacks.ModelCheckpoint(
                 dirpath=checkpoints_dir,
@@ -168,7 +173,7 @@ def main(
                 default_root_dir=log_directory,
                 max_epochs=args.n_epochs,
                 callbacks=checkpoint_callback,
-                accelerator=args.device,
+                accelerator=accelerator,
                 num_sanity_val_steps=0,
                 enable_progress_bar=args.enable_progress_bar,
                 strategy=strategy

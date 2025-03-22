@@ -10,8 +10,8 @@ python -m mofa.agentic.run \
       --retrain-freq 1 \
       --num-epochs 4 \
       --num-samples 1024 \
-      --gen-batch-size 64 \
-      --simulation-budget 64 \
+      --gen-batch-size 128 \
+      --simulation-budget 10000 \
       --md-timesteps 100000 \
       --md-snapshots 10 \
       --retain-lammps \
@@ -19,7 +19,7 @@ python -m mofa.agentic.run \
       --dft-opt-steps 1 \
       --compute-config federated \
       --cpu-endpoint 166a9195-07cc-496b-96fd-8a4be5aec97a \
-      --polaris-endpoint TODO \
+      --polaris-endpoint acb10b91-e811-4d03-a0fc-dc3fb23bca0d \
       --log-level INFO
       # --maximum-strain 0.5 \
       # --lammps-on-ramdisk \

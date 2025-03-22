@@ -28,21 +28,28 @@ dependencies = [
     "colmena==0.7.*",
     "more-itertools",
     "parsl>=2023.04",
-    "ase>3.22",
     "tqdm",
+    
+    # Chemistry related stuff
+    "ase>3.22",
+    "rdkit>2024",
+    "pymatgen",
 
     # ML-related dependencies
     "pytorch-lightning",
     "wandb",
     "imageio",
+    "scikit-learn",
 
     # Performance tracking
     "gpustat",
 
     # Data management
     "pymongo>=4",
+    "pandas",
 
-    "ray[default]",
+    "globus-compute-sdk",
+    "globus-compute-endpoint",
 ]
 
 [tool.setuptools.packages.find]
