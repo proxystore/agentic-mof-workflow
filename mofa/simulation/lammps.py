@@ -33,12 +33,15 @@ class LAMMPSRunner:
                  lammps_command: Sequence[str] = ("lmp_serial",),
                  lmp_sims_root_path: str = "lmp_sims",
                  lammps_environ: dict[str, str] | None = None,
-                 delete_finished: bool = True):
+                 delete_finished: bool = True,
+                 timeout: int | None = None,
+        ):
         self.lammps_command = lammps_command
         self.lmp_sims_root_path = lmp_sims_root_path
         os.makedirs(self.lmp_sims_root_path, exist_ok=True)
         self.lammps_environ = lammps_environ.copy()
         self.delete_finished = delete_finished
+        self.timeout = timeout
 
     def prep_molecular_dynamics_single(self, run_name: str, atoms: ase.Atoms, timesteps: int, report_frequency: int, stepsize_fs: float = 0.5) -> str:
         """Use cif2lammps to assign force field to a single MOF and generate input files for lammps simulation
@@ -159,4 +162,11 @@ write_data          relaxing.*.data
             if self.lammps_environ is not None:
                 env = os.environ.copy()
                 env.update(self.lammps_environ)
-            return run(list(self.lammps_command) + ['-i', 'in.lmp'], cwd=lmp_path, stdout=fp, stderr=fe, env=env)
+            return run(
+                list(self.lammps_command) + ['-i', 'in.lmp'],
+                cwd=lmp_path,
+                stdout=fp,
+                stderr=fe,
+                env=env,
+                timeout=self.timeout,
+            )

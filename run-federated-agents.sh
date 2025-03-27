@@ -7,10 +7,10 @@ python -m mofa.agentic.run \
       --generator-config-path models/geom-300k/config-tf32-a100.yaml \
       --maximum-train-size 2048 \
       --maximum-strain 100000 \
-      --retrain-freq 1 \
+      --retrain-freq 64 \
       --num-epochs 4 \
-      --num-samples 1024 \
-      --gen-batch-size 128 \
+      --num-samples 512 \
+      --gen-batch-size 64 \
       --simulation-budget 10000 \
       --md-timesteps 100000 \
       --md-snapshots 10 \

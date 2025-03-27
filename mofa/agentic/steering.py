@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import itertools
 import logging
 import pathlib
@@ -53,7 +54,12 @@ from mofa.simulation.lammps import LAMMPSRunner
 from mofa.simulation.raspa import RASPARunner
 from mofa.utils.conversions import write_to_string
 
-ACTION_TIMEOUT = 60
+ACTION_TIMEOUT = 120
+
+@dataclasses.dataclass(order=True)
+class _Item:
+    priority: float
+    value: Any = dataclasses.field(compare=False)
 
 
 class MOFABehavior(Behavior):
@@ -209,7 +215,7 @@ class Database(MOFABehavior):
         # is the only place where this action gets triggered, but if that
         # changes we'd need a better way to track.
         self.lammps_completed += 1
-        if self.lammps_completed > self.trainer.minimum_train_size:
+        if self.lammps_completed >= self.trainer.minimum_train_size:
             self.retrain.set()
 
     @action
@@ -222,7 +228,7 @@ class Database(MOFABehavior):
         # is the only place where this action gets triggered, but if that
         # changes we'd need a better way to track.
         self.raspa_completed += 1
-        if self.raspa_completed > self.trainer.minimum_train_size:
+        if self.raspa_completed >= self.trainer.minimum_train_size:
             self.retrain.set()
 
 
@@ -352,38 +358,41 @@ class Generator(MOFABehavior):
         retrain_dir = self.trainer.retrain_dir / f"model-v{version}"
         retrain_dir.mkdir(parents=True)
 
-        future = retrain_task(
-            starting_model=self.initial_model_path,
-            run_directory=retrain_dir,
-            config_path=self.trainer.config_path,
-            examples=examples,
-            num_epochs=self.trainer.num_epochs,
-            device=self.trainer.device,
-        )
-        self.retrain_tasks[version] = future
+        # future = retrain_task(
+        #     starting_model=self.initial_model_path,
+        #     run_directory=retrain_dir,
+        #     config_path=self.trainer.config_path,
+        #     examples=examples,
+        #     num_epochs=self.trainer.num_epochs,
+        #     device=self.trainer.device,
+        # )
+        # self.retrain_tasks[version] = future
         self.logger.info(
             "Submitted retrain task (version=%d, path=%s)",
             version,
             retrain_dir,
         )
 
-        try:
-            path = future.result()
-        except Exception:
-            self.logger.exception("Error in retrain task")
-        else:
-            new_model_path = self.config.model_dir / f"model-v{version}.ckpt"
-            self.config.model_dir.mkdir(exist_ok=True, parents=True)
-            shutil.copyfile(path, new_model_path)
-            self.model_iteration = version
-            self.latest_model_path = new_model_path
-            self.logger.info(
-                "Received retrain task (version=%d, path=%s)",
-                version,
-                new_model_path,
-            )
-        finally:
-            shutil.rmtree(retrain_dir)
+        import time
+        time.sleep(100)
+        self.logger.info("Completed simulationm train")
+        # try:
+        #     path = future.result()
+        # except Exception:
+        #     self.logger.exception("Error in retrain task")
+        # else:
+        #     new_model_path = self.config.model_dir / f"model-v{version}.ckpt"
+        #     self.config.model_dir.mkdir(exist_ok=True, parents=True)
+        #     shutil.copyfile(path, new_model_path)
+        #     self.model_iteration = version
+        #     self.latest_model_path = new_model_path
+        #     self.logger.info(
+        #         "Received retrain task (version=%d, path=%s)",
+        #         version,
+        #         new_model_path,
+        #     )
+        # finally:
+        #     shutil.rmtree(retrain_dir)
 
     @action
     def retrain(self, examples: list[MOFRecord]) -> None:
@@ -531,8 +540,10 @@ class Validator(MOFABehavior):
         self.runner = LAMMPSRunner(
             lammps_command=config.lammps_command,
             lmp_sims_root_path=config.lmp_sims_root_path,
+            # lammps_environ={'OMP_NUM_THREADS': '8', **config.lammps_environ},
             lammps_environ=config.lammps_environ.copy(),
             delete_finished=config.delete_finished,
+            timeout=None,
         )
         self.simulations_budget = config.simulation_budget
         self.queue_threshold = max(
@@ -588,7 +599,7 @@ class Validator(MOFABehavior):
             "Added mofs to validation queue (count=%d)",
             len(mofs),
         )
-        self._check_queue_depth(timeout=ACTION_TIMEOUT)
+        # self._check_queue_depth(timeout=ACTION_TIMEOUT)
 
     @loop
     def monitor_budget(self, shutdown: Event) -> None:
@@ -610,6 +621,8 @@ class Validator(MOFABehavior):
         # with the process_validation loop to determine the max number of
         # assembly tasks to run at any point.
         while not shutdown.is_set():
+            self._check_queue_depth()
+
             # Acquired workers are released in the callback on the task future.
             if not self.validator_count.acquire(timeout=1):
                 continue
@@ -618,6 +631,7 @@ class Validator(MOFABehavior):
                 record = self.validator_queue.pop()
             except IndexError:
                 self.validator_count.release()
+                time.sleep(1)
                 continue
 
             future = validate_structure_task(
@@ -728,7 +742,7 @@ class Optimizer(MOFABehavior):
     def submit_mof(self, record: MOFRecord) -> None:
         # Submit a MOF to the Optimizer's queue for optimization.
         priority = record.structure_stability["uff"]
-        self.optimize_queue.put((priority, record))
+        self.optimize_queue.put(_Item(priority, record))
         self.logger.info("Added mof to optimizer queue (name=%s)", record.name)
 
     @loop
@@ -741,7 +755,8 @@ class Optimizer(MOFABehavior):
                 continue
 
             try:
-                _, record = self.optimize_queue.get(timeout=1)
+                item = self.optimize_queue.get(timeout=1)
+                record = item.value
             except Empty:
                 self.optimizer_count.release()
                 continue

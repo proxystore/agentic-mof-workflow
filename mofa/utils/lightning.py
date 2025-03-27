@@ -18,13 +18,13 @@ class XPUAccelerator(Accelerator):
     def parse_devices(devices: Any) -> Any:
         # Put parsing logic here how devices can be passed into the Trainer
         # via the `devices` argument
-        return devices
+        return list(range(int(devices)))
 
     @staticmethod
     def get_parallel_devices(devices: Any) -> Any:
         # Here, convert the device indices to actual device objects
-        if isinstance(devices, int):
-            devices = list(range(devices))
+        # if isinstance(devices, int):
+        #     devices = list(range(devices))
         return [torch.device("xpu", idx) for idx in devices]
 
     @staticmethod

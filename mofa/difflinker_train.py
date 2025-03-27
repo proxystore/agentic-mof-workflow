@@ -3,28 +3,21 @@ import os
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
-import torch
 from pytorch_lightning import Trainer, callbacks
 from pytorch_lightning.callbacks import TQDMProgressBar
 from pytorch_lightning.strategies import SingleDeviceStrategy
 
-try:
-    import intel_extension_for_pytorch as ipex  # noqa: F401
-    if torch.xpu.is_available():
-        import oneccl_bindings_for_pytorch  # noqa: F401
-except ImportError:
-    pass
+# try:
+#     import torch
+#     import intel_extension_for_pytorch as ipex  # noqa: F401
+#     if torch.xpu.is_available():
+#         import oneccl_bindings_for_pytorch  # noqa: F401
+# except ImportError:
+#     pass
 
-from mofa.utils.lightning import XPUAccelerator
 from mofa.utils.src.const import NUMBER_OF_ATOM_TYPES, GEOM_NUMBER_OF_ATOM_TYPES
 from mofa.utils.src.lightning import DDPM
 from mofa.utils.src.utils import disable_rdkit_logging
-
-
-def _intel_on_train_start(trainer: Trainer):
-    """Hook for optimizing the model and optimizer before training"""
-    assert len(trainer.optimizers) == 1, 'We only support one optimizer for now'
-    trainer.model, trainer.optimizers[0] = ipex.optimize(trainer.model, optimizer=trainer.optimizers[0])
 
 
 def get_args(args: list[str]) -> argparse.Namespace:
@@ -134,6 +127,7 @@ def main(
         args: Arguments from `get_args` and the configuration file
         run_directory: Directory in which to write output files
     """
+    from mofa.utils.lightning import XPUAccelerator
 
     # TODO (wardlt): I trimmed off Hyun's code for organizing experimental data. We should put it back if
     #  we'd want to use this codebase for experimenting with DiffLinker as well as using it production
@@ -159,6 +153,7 @@ def main(
             strategy = 'ddp_spawn' if args.strategy is None else args.strategy
             if args.device == 'xpu':
                 accelerator = XPUAccelerator()
+                # strategy = SingleDeviceStrategy(device='xpu')
             else:
                 accelerator = args.device
 

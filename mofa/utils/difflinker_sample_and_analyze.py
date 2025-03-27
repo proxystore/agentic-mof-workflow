@@ -3,13 +3,16 @@ from typing import Iterator
 import os
 
 
+import socket
 import torch
-try:
-    import intel_extension_for_pytorch as ipex
-except ImportError:
-    ipex = None
 import numpy as np
 from rdkit import Chem
+
+try:
+    import intel_extension_for_pytorch as ipex  # noqa: F401
+    import oneccl_bindings_for_pytorch as torch_ccl  # noqa: F401
+except ImportError:
+    pass
 
 from mofa.model import LigandTemplate, LigandDescription
 from mofa.utils.src import const

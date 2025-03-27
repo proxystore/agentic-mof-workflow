@@ -49,14 +49,15 @@ class PolarisSingleNode(ComputeConfig):
 
 @dataclasses.dataclass(kw_only=True)
 class FederatedConfig(ComputeConfig):
-    # Generator, retrain, and validators share a single debug aurora node
-    # with 12 GPUs
+    # Generator, retrain share a single debug aurora node with 12 GPU tiles
     num_retrain_workers = 1
-    num_generator_workers = 3
-    num_validator_workers = 8
+    num_generator_workers = 5
+
+    # Validator share two dubug-scaling with 12 whole GPUs
+    num_validator_workers = 12
 
     # Assembly and optimizer share the chameleon node
-    num_assembly_workers = 64
+    num_assembly_workers = 8
     num_estimator_workers = 16
 
     # Optimizer workers have a single polaris debug job with four GPUs
@@ -72,12 +73,14 @@ class FederatedConfig(ComputeConfig):
         "/lus/eagle/projects/ExaMol/cp2k-2024.1/exe/local_cuda/cp2k_shell.psmp "
     )
     lammps_cmd = (
-        "/flare/proxystore/jgpaul/lammps/build/lmp",
-        "-sf",
-        "gpu",
-        "-pk",
-        "gpu",
-        "1",
+        # "/flare/proxystore/jgpaul/lammps/build-cpu/lmp",
+        "/flare/proxystore/jgpaul/lammps/build-nompi-cpu/lmp",
+        # "/flare/proxystore/jgpaul/lammps/build/lmp",
+        # "-sf",
+        # "gpu",
+        # "-pk",
+        # "gpu",
+        # "1",
     )
     lammps_env: dict[str, str] = dataclasses.field(default_factory=dict)
 

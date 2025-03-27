@@ -7,10 +7,22 @@ from tempfile import TemporaryDirectory
 from typing import Iterator
 from pathlib import Path
 
-from mofa.model import LigandDescription, LigandTemplate, MOFRecord
-from mofa.utils.difflinker_sample_and_analyze import main_run
-from mofa.difflinker_train import get_args, main
+import socket
 import yaml
+# TODO (wardlt): Torch is imported in the subsequent MOFA modules
+#  I plan to refactor those modules eventually,
+#  so am putting the Intel GPU imports here until I
+#  shuffle everything into a good structure
+# try:
+#     # Only run on compute nodes
+#     import torch
+#     if socket.gethostname().startswith('x'):
+#         import intel_extension_for_pytorch as ipex  # noqa: F401
+#         import oneccl_bindings_for_pytorch as torch_ccl  # noqa: F401
+# except ImportError:
+#     pass
+
+from mofa.model import LigandDescription, LigandTemplate, MOFRecord
 
 
 def train_generator(
@@ -35,6 +47,7 @@ def train_generator(
     Returns:
         Path to the new model weights
     """
+    from mofa.difflinker_train import get_args, main
 
     # Load configuration from YML file
     #  TODO (wardlt): Move away from argparse? Could simplify making modular configuration files
@@ -101,6 +114,7 @@ def run_generator(
     Returns:
         New ligands
     """
+    from mofa.utils.difflinker_sample_and_analyze import main_run
 
     with TemporaryDirectory(prefix='mofagen-') as tmpdir:
         # Produce a sample directory full of XYZ files
