@@ -5,12 +5,14 @@ import dataclasses
 import itertools
 import logging
 import pathlib
+import os
 import random
 import shutil
 import subprocess
 import threading
 import time
 import traceback
+import uuid
 from collections import defaultdict
 from collections import deque
 from collections.abc import Sequence
@@ -29,6 +31,7 @@ import pymongo
 from aeris.behavior import action
 from aeris.behavior import Behavior
 from aeris.behavior import loop
+from aeris.logging import init_logging
 from aeris.handle import Handle
 
 from mofa import db as mofadb
@@ -55,6 +58,7 @@ from mofa.simulation.raspa import RASPARunner
 from mofa.utils.conversions import write_to_string
 
 ACTION_TIMEOUT = 120
+
 
 @dataclasses.dataclass(order=True)
 class _Item:
@@ -97,11 +101,16 @@ class Database(MOFABehavior):
     def on_setup(self) -> None:
         super().on_setup()
 
-        self.retrain = Event()
-
         run_dir = pathlib.Path(self.config.run_dir)
         mongo_dir = run_dir / "db"
         mongo_dir.mkdir(parents=True)
+
+        init_logging(
+            logfile=os.path.join(self.config.run_dir, "log.txt"),
+        )
+
+        self.retrain = Event()
+
         self.mongo_proc = subprocess.Popen(
             f"mongod --wiredTigerCacheSizeGB 4 --dbpath {mongo_dir.absolute()} "
             f"--logpath {(run_dir / 'mongo.log').absolute()}".split(),
@@ -307,6 +316,7 @@ class Generator(MOFABehavior):
                 n_samples=self.config.num_samples,
                 device=self.config.device,
             )
+            future._id = uuid.uuid4()
             self.logger.info(
                 "Submitted generate-ligands task (type=%s size=%d, "
                 "samples=%d, model=%d)",
@@ -315,6 +325,7 @@ class Generator(MOFABehavior):
                 self.config.num_samples,
                 self.model_iteration,
             )
+            self.logger.info("START generate-ligands %s", future._id)
             self.generator_tasks.add(future)
             future.add_done_callback(self._generate_ligands_callback)
             # Push this generation task back on the queue
@@ -323,6 +334,7 @@ class Generator(MOFABehavior):
     def _generate_ligands_callback(self, future) -> None:
         self.generator_count.release()
         self.generator_tasks.remove(future)
+        self.logger.info("END generate-ligands %s", future._id)
         try:
             valid_ligands, anchor_type = future.result()
         except Exception:
@@ -367,15 +379,18 @@ class Generator(MOFABehavior):
         #     device=self.trainer.device,
         # )
         # self.retrain_tasks[version] = future
-        self.logger.info(
-            "Submitted retrain task (version=%d, path=%s)",
-            version,
-            retrain_dir,
-        )
+        # self.logger.info(
+        #     "Submitted retrain task (version=%d, path=%s)",
+        #     version,
+        #     retrain_dir,
+        # )
 
+        uid = uuid.uuid4()
+        self.logger.info("START retrain %s", uid)
         import time
+
         time.sleep(100)
-        self.logger.info("Completed simulationm train")
+        self.logger.info("END retrain %s", uid)
         # try:
         #     path = future.result()
         # except Exception:
@@ -414,6 +429,10 @@ class Assembler(MOFABehavior):
 
     def on_setup(self) -> None:
         super().on_setup()
+
+        init_logging(
+            logfile=os.path.join(self.config.run_dir, "log.txt"),
+        )
 
         config = get_parsl_config(
             "local",
@@ -487,11 +506,14 @@ class Assembler(MOFABehavior):
                 to_make=self.config.num_mofs,
                 attempts=self.config.max_attempts,
             )
+            future._id = uuid.uuid4()
+            self.logger.info("START assemble-mofs %s", future._id)
             self.logger.info("Submitted assemble-mofs task")
             self.assembly_tasks.add(future)
             future.add_done_callback(self._assembly_task_callback)
 
     def _assembly_task_callback(self, future: Future) -> None:
+        self.logger.info("END assemble-mofs %s", future._id)
         self.assembly_count.release()
         self.assembly_tasks.remove(future)
         try:
@@ -621,7 +643,7 @@ class Validator(MOFABehavior):
         # with the process_validation loop to determine the max number of
         # assembly tasks to run at any point.
         while not shutdown.is_set():
-            self._check_queue_depth()
+            self._check_queue_depth(timeout=ACTION_TIMEOUT)
 
             # Acquired workers are released in the callback on the task future.
             if not self.validator_count.acquire(timeout=1):
@@ -640,6 +662,8 @@ class Validator(MOFABehavior):
                 timesteps=self.config.timesteps,
                 report_frequency=self.config.report_frequency,
             )
+            future._id = uuid.uuid4()
+            self.logger.info("START validate-structures %s", future._id)
             self.logger.info(
                 "Submitted validate-structures task (name=%s)",
                 record.name,
@@ -679,6 +703,7 @@ class Validator(MOFABehavior):
             self.logger.info("Submitted record to database (name=%s)", record.name)
 
     def _validate_task_callback(self, future: Future) -> None:
+        self.logger.info("END validate-structures %s", future._id)
         self.validator_count.release()
         self.validator_tasks.remove(future)
         try:
@@ -715,6 +740,10 @@ class Optimizer(MOFABehavior):
     def on_setup(self) -> None:
         super().on_setup()
 
+        init_logging(
+            logfile=os.path.join(self.config.run_dir, "log.txt"),
+        )
+
         config = get_parsl_config(
             "polaris",
             self.config.run_dir,
@@ -723,7 +752,7 @@ class Optimizer(MOFABehavior):
 
         self.cp2k_runner = CP2KRunner(
             cp2k_invocation=self.config.cp2k_cmd,
-            run_dir=self.config.cp2k_dir,
+            run_dir=pathlib.Path(self.config.cp2k_dir),
         )
         self.records: dict[str, MOFRecord] = {}
         self.optimizer_count = threading.Semaphore(self.config.num_workers)
@@ -771,7 +800,10 @@ class Optimizer(MOFABehavior):
                 runner=self.cp2k_runner,
                 mof=record,
                 steps=self.config.cp2k_steps,
+                fmax=0.1,
             )
+            future._id = uuid.uuid4()
+            self.logger.info("START optimize-cells %s", future._id)
             self.logger.info(
                 "Submitted optimize-cells task (name=%s)",
                 record.name,
@@ -780,6 +812,7 @@ class Optimizer(MOFABehavior):
             future.add_done_callback(self._optimize_cells_task_callback)
 
     def _optimize_cells_task_callback(self, future) -> None:
+        self.logger.info("END optimize-cells %s", future._id)
         self.optimizer_count.release()
         self.optimize_tasks.remove(future)
         try:
@@ -790,7 +823,7 @@ class Optimizer(MOFABehavior):
 
         self.logger.info("Completed optimize-cells task (name=%s)", record.name)
 
-        action_future = self.estimate.submit("submit_atoms", record, atoms)
+        action_future = self.estimator.submit("submit_atoms", record, atoms)
         try:
             action_future.result(timeout=ACTION_TIMEOUT)
         except TimeoutError:
@@ -817,6 +850,10 @@ class Estimator(MOFABehavior):
     def on_setup(self) -> None:
         super().on_setup()
 
+        init_logging(
+            logfile=os.path.join(self.config.run_dir, "log.txt"),
+        )
+
         config = get_parsl_config(
             "local",
             self.config.run_dir,
@@ -825,7 +862,7 @@ class Estimator(MOFABehavior):
         parsl.load(config)
 
         self.raspa_runner = RASPARunner(
-            raspa_sims_root_path=str(self.config.raspa_dir),
+            raspa_sims_root_path=pathlib.Path(self.config.raspa_dir),
         )
         self.estimate_queue: Queue[tuple[str, ase.Atoms]] = Queue()
         self.estimate_tasks: set[Future] = {}
@@ -859,11 +896,14 @@ class Estimator(MOFABehavior):
                 name,
                 timesteps=self.config.raspa_timesteps,
             )
+            future._id = uuid.uuid4()
+            self.logger.info("START estimate-adsorption %s", future._id)
             self.logger.info("Submitted estimate-adsorption task (name=%s)", name)
             self.estimate_tasks.add(future)
             future.add_done_callback(self._estimate_adsorption_task_callback)
 
     def _estimate_adsorption_task_callback(self, future) -> None:
+        self.logger.info("END estimate-adsorption %s", future._id)
         self.estimate_tasks.remove(future)
         try:
             name, storage_mean, storage_std = future.result()

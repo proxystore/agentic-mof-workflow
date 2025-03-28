@@ -12,7 +12,7 @@ python -m mofa.agentic.run \
       --num-samples 512 \
       --gen-batch-size 64 \
       --simulation-budget 10000 \
-      --md-timesteps 100000 \
+      --md-timesteps 1000000 \
       --md-snapshots 10 \
       --retain-lammps \
       --raspa-timesteps 1000 \

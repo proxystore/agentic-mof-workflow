@@ -79,9 +79,10 @@ def optimize_cells_and_compute_charges_task(
     runner: CP2KRunner,
     mof: MOFRecord,
     steps: int,
+    fmax: float = 1e-2,
 ) -> tuple[MOFRecord, ase.Atoms]:
     # Note: we don't use the atoms yet.
-    _, path = runner.run_optimization(mof, steps=steps)
+    _, path = runner.run_optimization(mof, steps=steps, fmax=fmax)
     atoms = compute_partial_charges(path)
     return mof, atoms
 

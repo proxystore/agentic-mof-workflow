@@ -434,14 +434,14 @@ def main() -> int:
     )
     optimizer_config = OptimizerConfig(
         cp2k_cmd=compute.cp2k_cmd,
-        cp2k_dir=run_dir / "cp2k-runs",
+        cp2k_dir=str(polaris_run_dir / "optimizer" / "cp2k-runs"),
         cp2k_steps=args.dft_opt_steps,
         num_workers=compute.num_optimizer_workers,
         run_dir=str(polaris_run_dir / "optimizer"),
     )
     estimator_config = EstimatorConfig(
         num_workers=compute.num_estimator_workers,
-        raspa_dir=run_dir / "raspa-runs",
+        raspa_dir=str(ccloud_run_dir / "estimator" / "raspa-runs"),
         raspa_timesteps=args.raspa_timesteps,
         run_dir=str(ccloud_run_dir / "estimator"),
     )

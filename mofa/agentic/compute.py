@@ -54,7 +54,7 @@ class FederatedConfig(ComputeConfig):
     num_generator_workers = 5
 
     # Validator share two dubug-scaling with 12 whole GPUs
-    num_validator_workers = 12
+    num_validator_workers = 24
 
     # Assembly and optimizer share the chameleon node
     num_assembly_workers = 8
