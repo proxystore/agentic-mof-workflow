@@ -8,7 +8,7 @@ python -m mofa.agentic.run \
       --maximum-train-size 2048 \
       --maximum-strain 100000 \
       --retrain-freq 64 \
-      --num-epochs 4 \
+      --num-epochs 32 \
       --num-samples 512 \
       --gen-batch-size 64 \
       --simulation-budget 10000 \

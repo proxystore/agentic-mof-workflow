@@ -153,7 +153,7 @@ def main(
             strategy = 'ddp_spawn' if args.strategy is None else args.strategy
             if args.device == 'xpu':
                 accelerator = XPUAccelerator()
-                # strategy = SingleDeviceStrategy(device='xpu')
+                strategy = SingleDeviceStrategy(device='xpu')
             else:
                 accelerator = args.device
 
@@ -175,8 +175,8 @@ def main(
             )
 
             # Add a callback for fit setup
-            if args.device == "xpu":
-                trainer.on_fit_start = _intel_on_train_start
+            # if args.device == "xpu":
+            #     trainer.on_fit_start = _intel_on_train_start
 
             # Get the model
             if args.resume is None:

@@ -259,7 +259,6 @@ class Generator(MOFABehavior):
         self.model_iteration = 0
 
         self.generator_tasks: set[Future] = set()
-        self.retrain_tasks: dict[int, Future] = {}
 
         super().__init__(logger_name="Generator", **kwargs)
 
@@ -284,10 +283,6 @@ class Generator(MOFABehavior):
         self.logger.warning(
             "There are %s remaining generate-ligands task(s) after shutdown",
             len(self.generator_tasks),
-        )
-        self.logger.warning(
-            "There are %s remaining retrain task(s) after shutdown",
-            len(self.retrain_tasks),
         )
 
         super().on_shutdown()
@@ -369,49 +364,45 @@ class Generator(MOFABehavior):
     def _retrain(self, examples: list[MOFRecord]) -> None:
         version = self.model_iteration + 1
         retrain_dir = self.trainer.retrain_dir / f"model-v{version}"
-        retrain_dir.mkdir(parents=True)
+        retrain_dir.mkdir(parents=True, exist_ok=True)
 
-        # future = retrain_task(
-        #     starting_model=self.initial_model_path,
-        #     run_directory=retrain_dir,
-        #     config_path=self.trainer.config_path,
-        #     examples=examples,
-        #     num_epochs=self.trainer.num_epochs,
-        #     device=self.trainer.device,
-        # )
-        # self.retrain_tasks[version] = future
-        # self.logger.info(
-        #     "Submitted retrain task (version=%d, path=%s)",
-        #     version,
-        #     retrain_dir,
-        # )
-
-        uid = uuid.uuid4()
-        self.logger.info("START retrain %s", uid)
-        import time
-
-        time.sleep(100)
-        self.logger.info("END retrain %s", uid)
-        # try:
-        #     path = future.result()
-        # except Exception:
-        #     self.logger.exception("Error in retrain task")
-        # else:
-        #     new_model_path = self.config.model_dir / f"model-v{version}.ckpt"
-        #     self.config.model_dir.mkdir(exist_ok=True, parents=True)
-        #     shutil.copyfile(path, new_model_path)
-        #     self.model_iteration = version
-        #     self.latest_model_path = new_model_path
-        #     self.logger.info(
-        #         "Received retrain task (version=%d, path=%s)",
-        #         version,
-        #         new_model_path,
-        #     )
-        # finally:
-        #     shutil.rmtree(retrain_dir)
+        future = retrain_task(
+            starting_model=self.initial_model_path,
+            run_directory=retrain_dir,
+            config_path=self.trainer.config_path,
+            examples=examples,
+            num_epochs=self.trainer.num_epochs,
+            device=self.trainer.device,
+        )
+        future._id = uuid.uuid4()
+        self.logger.info("START retrain %s", future._id)
+        self.logger.info(
+            "Submitted retrain task (version=%d, path=%s)",
+            version,
+            retrain_dir,
+        )
+        try:
+            path = future.result()
+        except Exception:
+            self.logger.exception("Error in retrain task")
+        else:
+            new_model_path = self.config.model_dir / f"model-v{version}.ckpt"
+            self.config.model_dir.mkdir(exist_ok=True, parents=True)
+            shutil.copyfile(path, new_model_path)
+            self.model_iteration = version
+            self.latest_model_path = new_model_path
+            self.logger.info(
+                "Received retrain task (version=%d, path=%s)",
+                version,
+                new_model_path,
+            )
+        finally:
+            self.logger.info("END retrain %s", future._id)
+            shutil.rmtree(retrain_dir)
 
     @action
     def retrain(self, examples: list[MOFRecord]) -> None:
+        self.logger.info("Requested retrain")
         with self.retrain_lock:
             return self._retrain(examples)
 

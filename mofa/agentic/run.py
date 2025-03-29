@@ -16,6 +16,7 @@ import parsl
 from aeris.exception import MailboxClosedError
 from aeris.exchange.redis import RedisExchange
 from aeris.launcher.executor import ExecutorLauncher
+from aeris.logging import init_logging
 from aeris.manager import Manager
 from globus_compute_sdk import Executor
 from openbabel import openbabel
@@ -217,18 +218,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def configure_logging(run_dir: pathlib.Path, level: str) -> logging.Logger:
-    stream_handler = logging.StreamHandler(sys.stdout)
-    stream_handler.setLevel(level)
-
-    file_handler = logging.FileHandler(run_dir / "run.log")
-    file_handler.setLevel(logging.DEBUG)
-
-    logging.basicConfig(
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-        level=logging.DEBUG,
-        handlers=[stream_handler, file_handler],
-    )
-
+    init_logging(level=level, logfile=run_dir / "log.txt")
     return logging.getLogger("main")
 
 

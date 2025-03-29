@@ -47,6 +47,9 @@ def train_generator(
     Returns:
         Path to the new model weights
     """
+    import torch
+    import intel_extension_for_pytorch as ipex  # noqa: F401
+    import oneccl_bindings_for_pytorch as torch_ccl  # noqa: F401
     from mofa.difflinker_train import get_args, main
 
     # Load configuration from YML file
@@ -71,7 +74,7 @@ def train_generator(
     run_directory.mkdir(exist_ok=True)
     chkpt_dir = run_directory / 'chkpt'
     if starting_model is not None:
-        chkpt_dir.mkdir()
+        chkpt_dir.mkdir(exist_ok=True)
         shutil.copyfile(starting_model, chkpt_dir / 'difflinker_epoch=00.ckpt')
         args.resume = 'yes'
 
