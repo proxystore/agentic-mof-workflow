@@ -30,8 +30,8 @@ class PolarisSingleNode(ComputeConfig):
     num_estimator_workers = 2
     torch_device = "cuda"
     cp2k_cmd = (
-        "module restore && "
-        "mpiexec -n 1 --ppn 1 --env OMP_NUM_THREADS=8 --hosts $HOSTNAME "
+        "module restore ; "
+        # "mpiexec -n 1 --ppn 1 --env OMP_NUM_THREADS=8 --hosts $HOSTNAME "
         # "--cpu-bind depth --depth 8 "
         # "/lus/eagle/projects/ExaMol/cp2k-2024.1/set_affinity_gpu_polaris.sh "
         "/lus/eagle/projects/ExaMol/cp2k-2024.1/exe/local_cuda/cp2k_shell.psmp "
@@ -66,11 +66,14 @@ class FederatedConfig(ComputeConfig):
     torch_device = "xpu"
     # Runs on Polaris
     cp2k_cmd = (
-        "module restore && "
-        "mpiexec -n 1 --ppn 1 --env OMP_NUM_THREADS=8 --hosts $HOSTNAME "
+        # "module restore && "
+        # "mpiexec -n 1 --ppn 1 --env OMP_NUM_THREADS=8 --hosts $HOSTNAME "
         # "--cpu-bind depth --depth 8 "
         # "/lus/eagle/projects/ExaMol/cp2k-2024.1/set_affinity_gpu_polaris.sh "
-        "/lus/eagle/projects/ExaMol/cp2k-2024.1/exe/local_cuda/cp2k_shell.psmp "
+        # "/lus/eagle/projects/ExaMol/cp2k-2024.1/exe/local_cuda/cp2k_shell.psmp "
+        "module restore &> /dev/null && "
+        "OMP_NUM_THREADS=8 "
+        "/eagle/MOFA/lward/cp2k-2025.1/exe/local_cuda/cp2k_shell.ssmp"
     )
     lammps_cmd = (
         # "/flare/proxystore/jgpaul/lammps/build-cpu/lmp",
