@@ -107,6 +107,7 @@ class Database(MOFABehavior):
 
         init_logging(
             logfile=os.path.join(self.config.run_dir, "log.txt"),
+            color=False,
         )
 
         self.retrain = Event()
@@ -432,6 +433,7 @@ class Assembler(MOFABehavior):
 
         init_logging(
             logfile=os.path.join(self.config.run_dir, "log.txt"),
+            color=False,
         )
 
         config = get_parsl_config(
@@ -742,6 +744,7 @@ class Optimizer(MOFABehavior):
 
         init_logging(
             logfile=os.path.join(self.config.run_dir, "log.txt"),
+            color=False,
         )
 
         config = get_parsl_config(
@@ -852,6 +855,7 @@ class Estimator(MOFABehavior):
 
         init_logging(
             logfile=os.path.join(self.config.run_dir, "log.txt"),
+            color=False,
         )
 
         config = get_parsl_config(
