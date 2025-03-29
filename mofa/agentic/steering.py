@@ -803,7 +803,7 @@ class Optimizer(MOFABehavior):
                 runner=self.cp2k_runner,
                 mof=record,
                 steps=self.config.cp2k_steps,
-                fmax=0.1,
+                fmax=1.0,
             )
             future._id = uuid.uuid4()
             self.logger.info("START optimize-cells %s", future._id)
@@ -826,7 +826,7 @@ class Optimizer(MOFABehavior):
 
         self.logger.info("Completed optimize-cells task (name=%s)", record.name)
 
-        action_future = self.estimator.submit("submit_atoms", record, atoms)
+        action_future = self.estimator.action("submit_atoms", record, atoms)
         try:
             action_future.result(timeout=ACTION_TIMEOUT)
         except TimeoutError:
@@ -836,7 +836,7 @@ class Optimizer(MOFABehavior):
         except Exception:
             self.logger.exception("Error in submit-atoms action.")
         else:
-            self.logger.info("Submitted mofs to validator.")
+            self.logger.info("Submitted mofs to estimator.")
 
 
 class Estimator(MOFABehavior):
@@ -869,7 +869,7 @@ class Estimator(MOFABehavior):
             raspa_sims_root_path=pathlib.Path(self.config.raspa_dir),
         )
         self.estimate_queue: Queue[tuple[str, ase.Atoms]] = Queue()
-        self.estimate_tasks: set[Future] = {}
+        self.estimate_tasks: set[Future] = set()
         self.records: dict[str, MOFRecord] = {}
 
     def on_shutdown(self) -> None:

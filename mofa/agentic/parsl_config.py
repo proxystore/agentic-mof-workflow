@@ -148,7 +148,7 @@ def get_polaris_config(run_dir: str) -> Config:
         available_accelerators=user_opts["available_accelerators"],
         max_workers_per_node=user_opts["available_accelerators"],
         # This give optimal binding of threads to GPUs on a Polaris node
-        cpu_affinity="list:24-31,56-63:16-23,48-55:8-15,40-47:0-7,32-39",
+        # cpu_affinity="list:24-31,56-63:16-23,48-55:8-15,40-47:0-7,32-39",
         prefetch_capacity=0,
         provider=PBSProProvider(
             launcher=SimpleLauncher(),
@@ -177,6 +177,6 @@ def get_polaris_config(run_dir: str) -> Config:
         executors=[executor],
         run_dir=run_dir,
         initialize_logging=False,
-        retries=0,
+        retries=1,
         app_cache=False,
     )
