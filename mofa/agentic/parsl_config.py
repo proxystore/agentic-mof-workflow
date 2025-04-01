@@ -43,6 +43,8 @@ def get_aurora_config(run_dir: str) -> Config:
         max_workers_per_node=len(tile_names),
         cpu_affinity=cpu_affinity,
         prefetch_capacity=0,
+        heartbeat_period=15,
+        heartbeat_threshold=120,
         provider=PBSProProvider(
             account=user_opts["account"],
             queue="debug",
@@ -100,7 +102,7 @@ def get_aurora_config(run_dir: str) -> Config:
         executors=[ai_executor, val_executor],
         run_dir=run_dir,
         initialize_logging=False,
-        retries=0,
+        retries=1,
         app_cache=False,
     )
 
@@ -114,7 +116,7 @@ def get_local_config(
         max_workers_per_node=workers_per_node,
         address=address_by_hostname(),
         cores_per_worker=1,
-        provider=LocalProvider(init_blocks=1, max_blocks=1),
+        provider=LocalProvider(init_blocks=0, max_blocks=1),
     )
     return Config(
         executors=[executor],
@@ -136,7 +138,7 @@ def get_polaris_config(run_dir: str) -> Config:
         "account": "proxystore",
         "queue": "debug",
         "walltime": "1:00:00",
-        "nodes_per_block": 1,
+        "nodes_per_block": 2,
         "cpus_per_node": 32,
         "available_accelerators": 4,
     }

@@ -57,11 +57,11 @@ class FederatedConfig(ComputeConfig):
     num_validator_workers = 24
 
     # Assembly and optimizer share the chameleon node
-    num_assembly_workers = 8
-    num_estimator_workers = 16
+    num_assembly_workers = 4
+    num_estimator_workers = 8
 
     # Optimizer workers have a single polaris debug job with four GPUs
-    num_optimizer_workers = 4
+    num_optimizer_workers = 8
 
     torch_device = "xpu"
     # Runs on Polaris
