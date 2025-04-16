@@ -3,9 +3,16 @@ from typing import Iterator
 import os
 
 
+import socket
 import torch
 import numpy as np
 from rdkit import Chem
+
+try:
+    import intel_extension_for_pytorch as ipex  # noqa: F401
+    import oneccl_bindings_for_pytorch as torch_ccl  # noqa: F401
+except ImportError:
+    pass
 
 from mofa.model import LigandTemplate, LigandDescription
 from mofa.utils.src import const
@@ -77,6 +84,10 @@ def main_run(templates: list[LigandTemplate],
 
     # Pull the model from disk, evicting the old one if needed
     ddpm = load_model(model, device)
+
+    # If xpu, optimize
+    if device == "xpu":
+        ddpm = ipex.optimize(ddpm)
 
     if n_steps is not None:
         ddpm.edm.T = n_steps  # otherwise, ddpm.edm.T = 1000 default

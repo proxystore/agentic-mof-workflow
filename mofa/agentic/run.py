@@ -9,12 +9,14 @@ import os
 import pathlib
 import sys
 import typing
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
 import parsl
+from aeris.exception import MailboxClosedError
 from aeris.exchange.redis import RedisExchange
 from aeris.launcher.executor import ExecutorLauncher
-from aeris.launcher.thread import ThreadLauncher
+from aeris.logging import init_logging
 from aeris.manager import Manager
 from globus_compute_sdk import Executor
 from openbabel import openbabel
@@ -28,7 +30,7 @@ from mofa.agentic.config import GeneratorConfig
 from mofa.agentic.config import OptimizerConfig
 from mofa.agentic.config import TrainerConfig
 from mofa.agentic.config import ValidatorConfig
-from mofa.agentic.parsl import get_parsl_config
+from mofa.agentic.parsl_config import get_parsl_config
 from mofa.agentic.steering import Assembler
 from mofa.agentic.steering import Database
 from mofa.agentic.steering import Estimator
@@ -216,53 +218,48 @@ def parse_args() -> argparse.Namespace:
 
 
 def configure_logging(run_dir: pathlib.Path, level: str) -> logging.Logger:
-    stream_handler = logging.StreamHandler(sys.stdout)
-    stream_handler.setLevel(level)
-
-    file_handler = logging.FileHandler(run_dir / "run.log")
-    file_handler.setLevel(logging.DEBUG)
-
-    logging.basicConfig(
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-        level=logging.DEBUG,
-        handlers=[stream_handler, file_handler],
-    )
-
+    init_logging(level=level, logfile=run_dir / "log.txt")
     return logging.getLogger("main")
 
 
+@contextlib.contextmanager
 def create_managers(
     cpu_endpoint: str,
     polaris_endpoint: str,
     logger: logging.Logger,
 ) -> typing.Generator[dict[str, Manager], None, None]:
-    with contextlib.ExitStack() as stack:
-        exchange = RedisExchange(
-            host=os.environ["REDIS_HOST"],
-            port=os.environ["REDIS_PORT"],
-            password=os.environ["REDIS_PASS"],
-        )
+    exchange = RedisExchange(hostname='localhost', port=57347)
 
-        cpu_launcher = ExecutorLauncher(Executor(cpu_endpoint))
-        polaris_launcher = ExecutorLauncher(Executor(polaris_endpoint))
-        thread_launcher = ThreadLauncher()
+    cpu_launcher = ExecutorLauncher(Executor(cpu_endpoint), close_exchange=True)
+    polaris_launcher = ExecutorLauncher(Executor(polaris_endpoint), close_exchange=True)
+    thread_launcher = ExecutorLauncher(ThreadPoolExecutor(2), close_exchange=False)
 
-        cpu_manager = Manager(exchange=exchange, launcher=cpu_launcher)
-        polaris_manager = Manager(exchange=exchange, launcher=polaris_launcher)
-        thread_manager = Manager(exchange=exchange, launcher=thread_launcher)
+    cpu_manager = Manager(exchange=exchange, launcher=cpu_launcher)
+    polaris_manager = Manager(exchange=exchange, launcher=polaris_launcher)
+    thread_manager = Manager(exchange=exchange, launcher=thread_launcher)
 
-        managers = {
-            "cpu": cpu_manager,
-            "polaris": polaris_manager,
-            "thread": thread_manager,
-        }
-        for manager in managers.values():
-            stack.enter_context(manager)
+    managers = {
+        "cpu": cpu_manager,
+        "polaris": polaris_manager,
+        "thread": thread_manager,
+    }
 
-        logger.info("Initialized managers!")
-        yield manager
+    logger.info("Initialized managers!")
+    try:
+        yield managers
+    finally:
         logger.info("Shutting down managers...")
-    logger.info("All managers shutdown!")
+        for manager in managers.values():
+            for agent_id in manager.launcher.running():
+                handle = manager._handles[agent_id]
+                with contextlib.suppress(MailboxClosedError):
+                    handle.shutdown()
+            manager._multiplexer.close_bound_handles()
+            manager._multiplexer.close_mailbox()
+            manager._listener_thread.join()
+            manager.launcher.close()
+        exchange.close()
+        logger.info("All managers shutdown!")
 
 
 def run(  # noqa: PLR0913
@@ -331,7 +328,8 @@ def run(  # noqa: PLR0913
     managers["thread"].launch(validator_behavior, agent_id=validator_id)
     managers["polaris"].launch(optimizer_behavior, agent_id=optimizer_id)
     managers["cpu"].launch(estimator_behavior, agent_id=estimator_id)
-
+    logger.info("Launched all agents")
+    
     try:
         managers["thread"].wait(validator_id)
     except KeyboardInterrupt:
@@ -426,14 +424,14 @@ def main() -> int:
     )
     optimizer_config = OptimizerConfig(
         cp2k_cmd=compute.cp2k_cmd,
-        cp2k_dir=run_dir / "cp2k-runs",
+        cp2k_dir=str(polaris_run_dir / "optimizer" / "cp2k-runs"),
         cp2k_steps=args.dft_opt_steps,
         num_workers=compute.num_optimizer_workers,
         run_dir=str(polaris_run_dir / "optimizer"),
     )
     estimator_config = EstimatorConfig(
         num_workers=compute.num_estimator_workers,
-        raspa_dir=run_dir / "raspa-runs",
+        raspa_dir=str(ccloud_run_dir / "estimator" / "raspa-runs"),
         raspa_timesteps=args.raspa_timesteps,
         run_dir=str(ccloud_run_dir / "estimator"),
     )

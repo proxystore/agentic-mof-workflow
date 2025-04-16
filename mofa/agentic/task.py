@@ -21,7 +21,7 @@ from mofa.simulation.lammps import LAMMPSRunner
 from mofa.simulation.raspa import RASPARunner
 
 
-@python_app
+@python_app(executors=["generator"])
 def generate_ligands_task(  # noqa: PLR0913
     model: str | pathlib.Path,
     templates: Sequence[LigandTemplate],
@@ -60,7 +60,7 @@ def assemble_mofs_task(
     return assemble_many(ligand_options, nodes, to_make, attempts)
 
 
-@python_app
+@python_app(executors=["validator"])
 def validate_structure_task(
     runner: LAMMPSRunner,
     mof: MOFRecord,
@@ -79,9 +79,10 @@ def optimize_cells_and_compute_charges_task(
     runner: CP2KRunner,
     mof: MOFRecord,
     steps: int,
+    fmax: float = 1e-2,
 ) -> tuple[MOFRecord, ase.Atoms]:
     # Note: we don't use the atoms yet.
-    _, path = runner.run_optimization(mof, steps=steps)
+    _, path = runner.run_optimization(mof, steps=steps, fmax=fmax)
     atoms = compute_partial_charges(path)
     return mof, atoms
 
@@ -101,7 +102,7 @@ def estimate_adsorption_task(
     return name, gas_ads_mean, gas_ads_std
 
 
-@python_app
+@python_app(executors=["generator"])
 def retrain_task(  # noqa: PLR0913
     *,
     starting_model: str | pathlib.Path | None,
